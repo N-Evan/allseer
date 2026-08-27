@@ -28,7 +28,7 @@ That's it. SearXNG is optional (see below) - the keyless providers work without 
 | Provider | Source | Key needed |
 |---|---|---|
 | `hn` | Hacker News (Algolia API) | no |
-| `reddit` | Reddit search (old.reddit JSON) | no |
+| `reddit` | Reddit search (Atom feed; no score/comment counts) | no |
 | `github` | GitHub repo search | no (unauthenticated, ~10 searches/min) |
 | `arxiv` | arXiv Atom API | no |
 | `searxng` | Any SearXNG instance = news sites, blogs, everything else | no, but needs an instance |
@@ -46,6 +46,19 @@ docker run -d --name searxng -p 8080:8080 -e SEARXNG_SETTINGS_PATH=/etc/searxng 
 ```
 
 If it is unreachable the run logs the failure and continues with the other providers.
+
+## Two ways to run it
+
+- **Run Research Now** - every enabled topic, the daily dossier.
+- **Research this** (box at the top of Today) - a one-off subject typed right now, e.g.
+  *"RISC-V laptops"*, with an optional exclusion. It is researched immediately through the
+  same pipeline and stored in history, but never saved as a topic. Your exact wording is
+  used as the first search query, then the LLM generates angles around it.
+- **Stop** - appears while a run is in progress and cancels it immediately, including the
+  search, page fetch or Ollama call in flight. The run is marked `cancelled`; whatever was
+  already stored stays browsable.
+
+Only one run happens at a time - starting a second returns 409 rather than queueing.
 
 ## How the ranking works
 
@@ -107,7 +120,7 @@ allseer.db              created on first run
 
 ## Scheduling (optional)
 
-`python run.py --once` runs a full research pass and exits. Point Windows Task Scheduler at
+`python run.py --once` runs a full research pass over the enabled topics and exits. Point Windows Task Scheduler at
 it for a daily 7am dossier:
 
 ```powershell

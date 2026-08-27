@@ -31,7 +31,10 @@ def row_to_item(r, with_content=False):
 def state():
     con = db.connect()
     runs = [dict(r) for r in con.execute(
-        "SELECT id, day, started_at, finished_at, status FROM runs ORDER BY id DESC LIMIT 30")]
+        "SELECT r.id, r.day, r.started_at, r.finished_at, r.status, r.stats,"
+        "  (SELECT GROUP_CONCAT(x.topic_name, ' | ') FROM"
+        "     (SELECT DISTINCT topic_name FROM items WHERE run_id=r.id) x) AS subjects"
+        " FROM runs r ORDER BY r.id DESC LIMIT 30")]
     latest = con.execute(
         "SELECT id, day FROM runs WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
     days = [r["day"] for r in con.execute(
@@ -54,13 +57,29 @@ def status():
 
 @app.post("/api/run")
 async def run(body: dict | None = None):
+    """Body: {"topic_ids": [...]} for configured topics, or {"query": "..."} for a one-off
+    subject that is researched now and never stored as a topic."""
     if pipeline.STATUS["running"]:
         raise HTTPException(409, "a run is already in progress")
-    ids = (body or {}).get("topic_ids")
+    body = body or {}
+    ids = body.get("topic_ids")
+    query = " ".join(str(body.get("query") or "").split())
+    if query:
+        ad_hoc = {"name": query, "keywords": body.get("keywords", ""),
+                  "exclusions": body.get("exclusions", "")}
+        pipeline.start_background(None, ad_hoc)
+        return {"started": True, "ad_hoc": query}
     if not db.topics(enabled_only=True) and not ids:
         raise HTTPException(400, "no enabled topics")
     pipeline.start_background(ids)
     return {"started": True}
+
+
+@app.post("/api/stop")
+def stop():
+    if not pipeline.stop():
+        raise HTTPException(409, "no run is in progress")
+    return {"stopping": True}
 
 
 @app.get("/api/results")

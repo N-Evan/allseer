@@ -27,6 +27,19 @@ Headless: `python run.py --once`. Tests: `python tests/test_core.py`.
 - **Frontend is one static file** (`static/index.html`, vanilla JS). No framework, no build.
 - Vendored dependency list is deliberately 4 packages: fastapi, uvicorn, httpx, trafilatura.
 
+## Run control (added 2026-08-27)
+
+- `POST /api/stop` -> `pipeline.stop()` cancels the asyncio task, which interrupts whatever
+  it awaits. `run_research` catches `asyncio.CancelledError` **separately from `Exception`**
+  (it is a BaseException) to mark the run `cancelled` rather than `failed`, then re-raises.
+  Items stored for already-finished topics are kept on purpose.
+- `POST /api/run` takes either `{"topic_ids": [...]}` or `{"query": "..."}`. A `query` runs
+  an **ad-hoc** subject: a topic dict with `id=None`, so its items land with `topic_id NULL`
+  and `topic_name` = the query. Never stored in `topics`. The user's exact phrase is forced
+  in as the first search query before the LLM's generated angles.
+- Ad-hoc runs are identified in History by the `subjects` column in `/api/state`, which is a
+  `GROUP_CONCAT` of `items.topic_name` per run - deliberately no schema change.
+
 ## Provider facts learned the hard way (2026-08-27)
 
 - **Reddit**: `www.reddit.com/search.json` -> 403 for any UA. `old.reddit.com/search.json`

@@ -44,17 +44,28 @@ def _cfg(settings):
     }
 
 
-async def run_research(topic_ids=None):
+async def run_research(topic_ids=None, ad_hoc=None):
+    """ad_hoc: {"name": "<what to research>", "keywords": ..., "exclusions": ...} - a
+    one-off subject that is never stored as a topic. Its items get topic_id NULL."""
     if STATUS["running"]:
         raise RuntimeError("a research run is already in progress")
 
     settings = db.get_settings()
-    all_topics = db.topics(enabled_only=True)
-    if topic_ids:
-        wanted = set(int(t) for t in topic_ids)
-        all_topics = [t for t in db.topics(enabled_only=False) if t["id"] in wanted]
-    if not all_topics:
-        raise RuntimeError("no enabled topics - add one in Settings")
+    if ad_hoc:
+        query = " ".join(str(ad_hoc.get("name") or "").split())
+        if not query:
+            raise RuntimeError("nothing to research - type a subject or keywords")
+        all_topics = [{"id": None, "name": query,
+                       "keywords": ad_hoc.get("keywords") or "",
+                       "exclusions": ad_hoc.get("exclusions") or "",
+                       "ad_hoc": True}]
+    else:
+        all_topics = db.topics(enabled_only=True)
+        if topic_ids:
+            wanted = set(int(t) for t in topic_ids)
+            all_topics = [t for t in db.topics(enabled_only=False) if t["id"] in wanted]
+        if not all_topics:
+            raise RuntimeError("no enabled topics - add one in Settings")
 
     day = datetime.now(timezone.utc).date().isoformat()
     run_id = db.start_run(day)
@@ -103,6 +114,11 @@ async def run_research(topic_ids=None):
                 except Exception as e:
                     log("query generation failed (" + str(e)[:120] + ") - using templates")
                     queries = llm_mod.fallback_queries(topic, n_queries)
+                if topic.get("ad_hoc"):
+                    # Search what was actually typed, then the generated angles around it.
+                    exact = topic["name"]
+                    queries = [exact] + [q for q in queries if q.lower() != exact.lower()]
+                    queries = queries[:n_queries]
                 stats["queries"] += len(queries)
                 for q in queries:
                     log("  q: " + q)
@@ -180,6 +196,12 @@ async def run_research(topic_ids=None):
         log("run " + str(run_id) + " complete: " + json.dumps(
             {k: v for k, v in stats.items() if not k.endswith("errors")}))
         return stats
+    except asyncio.CancelledError:
+        STATUS["stats"] = stats
+        db.finish_run(run_id, "cancelled", stats, "stopped by user")
+        phase("cancelled")
+        log("run " + str(run_id) + " stopped by user. Anything already stored stays.")
+        raise
     except Exception as e:
         STATUS["error"] = type(e).__name__ + ": " + str(e)
         db.finish_run(run_id, "failed", stats, STATUS["error"])
@@ -191,15 +213,29 @@ async def run_research(topic_ids=None):
         STATUS["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def start_background(topic_ids=None):
+_TASK = None
+
+
+def start_background(topic_ids=None, ad_hoc=None):
+    global _TASK
     if STATUS["running"]:
         return False
-    asyncio.create_task(_guarded(topic_ids))
+    _TASK = asyncio.create_task(_guarded(topic_ids, ad_hoc))
     return True
 
 
-async def _guarded(topic_ids):
+def stop():
+    """Cancel the in-flight run. Cancelling the task interrupts whatever it is awaiting
+    (a search, a page fetch, an Ollama call), so this takes effect immediately."""
+    if _TASK is None or _TASK.done():
+        return False
+    _TASK.cancel()
+    log("stop requested")
+    return True
+
+
+async def _guarded(topic_ids, ad_hoc=None):
     try:
-        await run_research(topic_ids)
-    except Exception:
+        await run_research(topic_ids, ad_hoc)
+    except (Exception, asyncio.CancelledError):
         pass  # already recorded in STATUS and the runs table

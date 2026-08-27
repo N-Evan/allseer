@@ -82,10 +82,18 @@ label.f span{display:block;font-size:12px;color:var(--dim);margin-bottom:3px}
   <div class="grow"></div>
   <div class="status" id="status"><i class="dot"></i><span>idle</span></div>
   <button class="primary" id="runBtn">Run Research Now</button>
+  <button id="stopBtn" style="display:none;border-color:var(--bad);color:var(--bad)">Stop</button>
 </header>
 
 <main>
   <section id="view-today">
+    <div class="card" style="cursor:default;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input id="adhoc" placeholder="Research anything right now, e.g. RISC-V laptops, WebGPU inference..."
+             style="flex:1;min-width:260px">
+      <input id="adhocEx" placeholder="exclude (optional)" style="max-width:190px">
+      <button class="primary" id="adhocBtn">Research this</button>
+      <span class="hint">one-off - not saved as a topic</span>
+    </div>
     <div class="row">
       <select id="topicFilter" style="max-width:260px"><option value="">All topics</option></select>
       <input id="search" placeholder="Search title, summary, tag, domain..." style="max-width:320px">
@@ -229,6 +237,8 @@ function renderStatus(s){
   el.innerHTML = `<i class="dot ${cls}"></i><span>${esc(run ? s.phase : (s.error || s.phase))}</span>`;
   $('#runBtn').disabled = run;
   $('#runBtn').textContent = run ? 'Researching...' : 'Run Research Now';
+  $('#stopBtn').style.display = run ? '' : 'none';
+  $('#adhocBtn').disabled = run;
   $('#progressWrap').style.display = (run || (s.log||[]).length) ? '' : 'none';
   $('#phase').textContent = s.topic ? ('topic: ' + s.topic) : '';
   const log = $('#log');
@@ -263,6 +273,7 @@ function renderRuns(){
     <b>#${r.id}</b><span>${esc(r.day||'')}</span>
     <span class="badge">${esc(r.status)}</span>
     <span class="hint">${esc((r.started_at||'').replace('T',' '))}</span>
+    <span>${esc((r.subjects||'').slice(0,90) || 'nothing stored')}</span>
     <div class="grow"></div>
     <button data-open="${r.id}">Open</button></div>`).join('') || '<div class="empty">No runs yet.</div>';
 }
@@ -315,6 +326,20 @@ document.addEventListener('click', async e => {
     catch (err) { alert(err.message); }
     poll();
   }
+  if (t.id === 'stopBtn') {
+    t.disabled = true;
+    try { await api('/api/stop', {method:'POST'}); } catch (err) { alert(err.message); }
+    t.disabled = false;
+  }
+  if (t.id === 'adhocBtn') {
+    const q = $('#adhoc').value.trim();
+    if (!q) { $('#adhoc').focus(); return; }
+    try {
+      await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({query: q, exclusions: $('#adhocEx').value})});
+      show('today'); poll();
+    } catch (err) { alert(err.message); }
+  }
   const card = t.closest('.card[data-id]');
   if (card) openItem(card.dataset.id);
   if (t === $('#drawer')) $('#drawer').classList.remove('on');
@@ -355,6 +380,7 @@ document.addEventListener('click', async e => {
 });
 
 ['#topicFilter','#bucketFilter'].forEach(s => $(s).addEventListener('change', loadResults));
+$('#adhoc').addEventListener('keydown', e => { if (e.key === 'Enter') $('#adhocBtn').click(); });
 let deb; $('#search').addEventListener('input', () => { clearTimeout(deb); deb = setTimeout(loadResults, 300); });
 
 let wasRunning = false;

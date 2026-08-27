@@ -116,6 +116,12 @@ def test_emoji_titles_do_not_kill_logging():
     assert "judging 1/10" in pipeline.STATUS["log"][-1]
 
 
+def test_stop_is_safe_when_nothing_is_running():
+    from allseer import pipeline
+    assert pipeline.stop() is False          # no task -> no crash, just False
+    assert pipeline.STATUS["running"] is False
+
+
 def test_parse_json_survives_local_model_noise():
     assert parse_json('{"a": 1}')["a"] == 1
     assert parse_json('```json\n{"a": 2}\n```')["a"] == 2
