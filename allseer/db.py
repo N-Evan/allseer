@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS topics (
   name TEXT NOT NULL UNIQUE,
   keywords TEXT DEFAULT '',
   exclusions TEXT DEFAULT '',
+  feeds TEXT DEFAULT '',
+  providers TEXT DEFAULT '',
   enabled INTEGER DEFAULT 1,
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -65,9 +67,51 @@ CREATE INDEX IF NOT EXISTS idx_items_bucket ON items(bucket, trending_score, nic
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 
+# Feeds beat search APIs for gamedev/devlog material: they are complete, dated and free.
+DEFAULT_FEEDS = [
+    # game dev / art / industry
+    "https://80.lv/feed",
+    "https://www.gamedeveloper.com/rss.xml",
+    "https://www.gamesindustry.biz/feed",
+    "https://godotengine.org/rss.xml",
+    "https://itch.io/blog.rss",
+    # AI / engineering
+    "https://huggingface.co/blog/feed.xml",
+    "https://simonwillison.net/atom/everything/",
+    # reddit, via feeds rather than the rate-limited search API
+    "https://www.reddit.com/r/gamedev/top.rss?t=day",
+    "https://www.reddit.com/r/godot/top.rss?t=day",
+    "https://www.reddit.com/r/LocalLLaMA/top.rss?t=day",
+    "https://www.reddit.com/r/IndieDev/top.rss?t=day",
+    "https://www.reddit.com/r/leveldesign/top.rss?t=week",
+    "https://www.reddit.com/r/gamedesign/top.rss?t=week",
+]
+
+# Job boards, kept off the global rss_feeds list and pinned to the jobs topic instead:
+# a "gameplay programming" query must never match a job posting, and a role query must
+# never match a devlog. Verified live 2026-08-28 (parse + fresh dated entries):
+# weworkremotely 89, himalayas 100, jobicy 200, remotive 20, hnrss/jobs 20.
+# remoteok.com, workingnomads and gamesindustry.biz/jobs all serve malformed XML - do not
+# re-add them without checking parse_feed() handles the body.
+JOB_FEEDS = [
+    "https://weworkremotely.com/remote-jobs.rss",
+    "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+    "https://himalayas.app/jobs/rss",
+    "https://remotive.com/remote-jobs/feed",
+    "https://jobicy.com/?feed=job_feed",
+    "https://hnrss.org/jobs",
+    "https://hnrss.org/whoishiring/jobs",
+    # the hunting-strategy half of the topic: craft, not listings
+    "https://newsletter.pragmaticengineer.com/feed",
+    "https://www.reddit.com/r/cscareerquestions/top.rss?t=week",
+    "https://www.reddit.com/r/gamedevjobs/top.rss?t=week",
+    "https://www.reddit.com/r/experienceddevs/top.rss?t=week",
+]
+
 DEFAULT_SETTINGS = {
     "ollama_url": "http://localhost:11434",
     "ollama_model": "qwen2.5:14b",
+    "analysis_model": "",       # model for judging + analyst notes; empty = ollama_model
     "searxng_url": "",  # e.g. http://localhost:8080 - optional, other providers work without it
     "queries_per_topic": "6",
     "max_fetch": "40",
@@ -75,14 +119,106 @@ DEFAULT_SETTINGS = {
     "top_trending": "3",
     "top_niche": "5",
     "days_back": "3",
-    "providers": "hn,reddit,github,arxiv,searxng",
+    "drop_undated": "0",        # 1 = an item with no publish date is discarded, not kept
+    "suppress_seen_days": "21", # skip anything already ranked in a run this recent; 0 = off
+    "github_min_stars": "5",    # a repo this new needs some traction to be worth a slot; 0 = off
+    "providers": "hn,reddit,github,arxiv,searxng,rss",
+    "rss_feeds": " ".join(DEFAULT_FEEDS),
     "user_agent": "allseer/0.1 (personal research agent)",
 }
 
+# Exclusions shared by every topic: the noise that follows any tech query around.
+_NOISE = ("crypto, nft, token price, stock price, funding round, acquisition, layoffs, "
+          "hiring, job posting, salary, bootcamp, course, tutorial roundup, coupon, "
+          "giveaway, discount, sale, tier list, top 10 list")
+
+# Game *coverage* is not game *craft*. A GTA 6 teaser took a niche slot in a level-design
+# run before this existed; every game topic needs it, none of the AI/engineering ones do.
+_GAME_NOISE = (", trailer, teaser, cinematic reveal, release date, delayed to, "
+               "launch announcement, netflix adaptation, review score, metacritic, "
+               "sales figures, player count, esports, tournament, celebrity voice cast, "
+               "leak, datamine, fan theory")
+
 SEED_TOPICS = [
-    ("Local LLMs & inference", "ollama, quantization, gguf, vllm, llama.cpp", "crypto, nft"),
-    ("AI agents & tooling", "agent framework, mcp, tool use, retrieval", "stock price, funding round"),
+    ("Local AI & Inference",
+     "local llm, on-device inference, ollama, llama.cpp, gguf, quantization, vllm, sglang, "
+     "mlx, exllama, lm studio, kv cache, speculative decoding, fine-tuning lora, "
+     "open weights model release, small language model",
+     _NOISE + ", api pricing, benchmark leaderboard drama"),
+
+    ("Agentic Systems & Harnesses",
+     "agentic, agent harness, coding agent, mcp, model context protocol, tool use, "
+     "subagent, orchestration, context engineering, agent memory, agent eval, "
+     "claude code, cursor, aider, codex cli, autonomous refactoring, computer use",
+     _NOISE + ", agi hype, chatbot wrapper, prompt pack"),
+
+    ("Software Engineering",
+     "software architecture, refactoring, debugging techniques, performance profiling, "
+     "systems programming, type system, build system, testing strategy, observability, "
+     "concurrency, api design, postmortem, incident writeup, codebase migration",
+     _NOISE + ", leetcode, interview prep, certification, framework comparison listicle"),
+
+    ("Game Engines & Tech",
+     "godot, unreal engine, unity, bevy, custom engine, ecs, renderer, shader, "
+     "engine architecture, editor tooling, asset pipeline, physics engine, "
+     "gpu optimization, nanite, lumen, engine source",
+     _NOISE + ", gacha, casino, esports roster, console sales figures, review score" + _GAME_NOISE),
+
+    ("Gameplay Programming",
+     "gameplay systems, character controller, state machine, behavior tree, navmesh, "
+     "netcode, rollback, animation blending, hit detection, procedural generation, "
+     "game feel, juice, tuning, replay system, save system",
+     _NOISE + ", cheat, hack, mod menu, aimbot, patch notes balance" + _GAME_NOISE),
+
+    ("Level & Systems Design",
+     "level design, blockout, greybox, encounter design, pacing, spatial storytelling, "
+     "metroidvania layout, open world structure, systems design, economy design, "
+     "difficulty curve, playtesting, map layout analysis",
+     _NOISE + ", speedrun route, walkthrough, cheat, collectibles guide" + _GAME_NOISE),
+
+    ("Game Writing & Narrative",
+     "narrative design, game writing, branching dialogue, dialogue system, ink script, "
+     "yarn spinner, twine, quest design, worldbuilding, environmental storytelling, "
+     "character writing, player agency narrative, emergent narrative",
+     _NOISE + ", fanfiction, movie adaptation, tv series, book review, celebrity" + _GAME_NOISE),
+
+    ("Indie Games & Devlogs",
+     "devlog, indie dev, solo developer, postmortem, game jam, itch.io release, "
+     "steam page, early access lessons, marketing for indies, scope management, "
+     "shipped my game, revenue breakdown, prototype",
+     _NOISE + ", key giveaway, bundle deal, wishlist begging, asset flip" + _GAME_NOISE),
 ]
+
+
+# Everything _NOISE screens out is the actual subject here (hiring, salary, job posting),
+# so the jobs topic gets its own list: the scams and the roles that are not the target.
+_JOB_NOISE = ("crypto, nft, web3 airdrop, unpaid, revenue share only, rev-share, "
+              "equity only, volunteer, internship unpaid, mlm, commission only, "
+              "sales representative, customer support, virtual assistant, data entry, "
+              "recruiter spam, bootcamp, certification, course, leetcode grind, "
+              "sponsorship required, click here to apply now, "
+              # SEO pages that rank for every role term but are neither a job nor advice
+              "freelance, for hire, how to become, career guide, salary guide, "
+              "best jobs, top companies, academy, masterclass, roadmap 2026")
+
+JOB_TOPIC = (
+    "Remote Jobs: Software & Game Dev",
+    # These are the queries verbatim - a feed-pinned topic does not generate angles.
+    # Listing titles read "Senior Unity Developer (Remote)", so the terms have to be the
+    # role names themselves, two words each, matching how postings are actually written.
+    "remote software engineer, backend engineer, full stack developer, "
+    "python developer, typescript developer, platform engineer, "
+    "gameplay programmer, game developer, unity developer, unreal developer, "
+    "engine programmer, tools programmer, technical designer, "
+    "developer hiring, engineering interview, developer portfolio, "
+    "salary negotiation, remote work culture, career progression engineer",
+    _JOB_NOISE,
+    " ".join(JOB_FEEDS),
+    # arxiv, github and hn have nothing to say about a job hunt, but the shortlist gives
+    # every enabled provider an equal share - so they returned "solar eruption analyses"
+    # and Show HN posts for "platform engineer". Boards and the web only.
+    "rss,searxng",
+)
 
 
 def connect():
@@ -105,10 +241,23 @@ def init():
             "UPDATE runs SET status='interrupted', finished_at=datetime('now') "
             "WHERE status='running'"
         )
+        # Older databases predate the feeds column.
+        have = {r[1] for r in con.execute("PRAGMA table_info(topics)")}
+        if "feeds" not in have:
+            con.execute("ALTER TABLE topics ADD COLUMN feeds TEXT DEFAULT ''")
+        if "providers" not in have:
+            con.execute("ALTER TABLE topics ADD COLUMN providers TEXT DEFAULT ''")
         if not con.execute("SELECT 1 FROM topics LIMIT 1").fetchone():
             con.executemany(
                 "INSERT OR IGNORE INTO topics(name,keywords,exclusions) VALUES(?,?,?)", SEED_TOPICS
             )
+        # Seeded separately so it also lands in a database that already has the eight
+        # research topics; INSERT OR IGNORE on the UNIQUE name makes it idempotent.
+        con.execute(
+            "INSERT OR IGNORE INTO topics(name,keywords,exclusions,feeds,providers)"
+            " VALUES(?,?,?,?,?)",
+            JOB_TOPIC,
+        )
     con.close()
 
 
@@ -209,6 +358,19 @@ def insert_items(run_id, items):
                 out.append((cur.lastrowid, it))
     con.close()
     return out
+
+
+def seen_canon_urls(days):
+    """Canonical URLs already promoted to a bucket inside the last `days`. Re-showing them
+    every run is what made the feed look stale even when the sources had moved on."""
+    if not days or days <= 0:
+        return set()
+    con = connect()
+    rows = con.execute(
+        "SELECT DISTINCT canon_url FROM items WHERE bucket!='' AND canon_url IS NOT NULL"
+        " AND created_at >= datetime('now', ?)", ("-" + str(int(days)) + " days",)).fetchall()
+    con.close()
+    return {r["canon_url"] for r in rows}
 
 
 def set_deep_analysis(item_id, text):

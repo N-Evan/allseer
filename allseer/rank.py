@@ -6,8 +6,11 @@ Two rankings, deliberately different shapes:
 Swap the weights or add a strategy function; nothing else depends on the formulas.
 """
 import math
+import re
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 
 from .providers import NEWSY
 
@@ -66,6 +69,23 @@ def recency_score(item, now=None):
     return 0.5 ** (h / 24.0)
 
 
+def fresh_enough(item, days_back, drop_unknown=False):
+    """Hard freshness gate. days_back was only ever a per-provider hint, so items with an
+    old known date (GitHub created_at, an undated SearXNG hit, an HN fallback result) still
+    reached the ranker - where NICHE_WEIGHTS has no recency term at all and happily crowned
+    a 2014 repo. Enforce it once, centrally, for every provider.
+
+    Unknown date is kept by default (a lot of good pages publish none) and scored as ~72h
+    old; set drop_unknown to require a date.
+    """
+    if days_back <= 0:
+        return True
+    h = age_hours(item)
+    if h is None:
+        return not drop_unknown
+    return h <= days_back * 24 + 12  # slack for timezone-sloppy feeds
+
+
 # GitHub stars are a lifetime total, not today's conversation - they need a higher bar
 # than HN points or reddit score before they mean the same thing.
 DISCUSSION_CAP = {"github": 8000, "reddit": 1500, "hn": 1000, "paper": 200}
@@ -80,18 +100,107 @@ def cross_source_score(item):
     return min(1.0, (item.get("cluster_domains", 1) - 1) / 3.0)
 
 
+# --- topic relevance ------------------------------------------------------
+# Nothing used to check a result against its topic before the LLM saw it, so a run for
+# "Indie Games & Devlogs" paid to fetch and judge scope.riege.com (freight logistics),
+# forums.scopeusers.com and ajtmh.org (tropical medicine) - all matched on the word
+# "scope" alone. The judge caught them (19 of 20 came back off_topic) but only after the
+# inference budget was already spent on them.
+
+_WORD = re.compile(r"[a-z0-9+#]+")
+TOPIC_STOP = {"the", "and", "for", "with", "from", "your", "our", "new", "how", "why",
+              "what", "its", "into", "out", "own", "any", "all", "use", "using", "based"}
+
+
+@lru_cache(maxsize=128)
+def _terms(name, keywords):
+    """(phrases, words) for a topic. A phrase is a multi-word keyword - specific enough to
+    be worth two single-word hits. Cached: this is called once per result per topic."""
+    phrases, words = set(), set()
+    for k in [name] + str(keywords or "").split(","):
+        toks = [w for w in _WORD.findall(k.lower())
+                if len(w) > 2 and w not in TOPIC_STOP]
+        if len(toks) >= 2:
+            phrases.add(" ".join(toks))
+        words.update(toks)
+    return frozenset(phrases), frozenset(words)
+
+
+# One shared generic word ("game", "developer") is not evidence of anything: the AI feeds
+# leaked "llm-anthropic 0.27" into an indie-devlog run on a single-word match. Two distinct
+# words, or one multi-word keyword, is the bar.
+ON_TOPIC_MIN = 2
+
+
+def on_topic(item, topic):
+    return topic_match(item, topic) >= ON_TOPIC_MIN
+
+
+def topic_match(item, topic):
+    """How much topic vocabulary the result carries. 0 means nothing matched at all."""
+    text = " ".join(str(item.get(k) or "") for k in
+                    ("title", "snippet", "domain", "url")).lower()
+    phrases, words = _terms(topic.get("name") or "", topic.get("keywords") or "")
+    toks = set(_WORD.findall(text))
+    return 2 * sum(1 for p in phrases if p in text) + len(words & toks)
+
+
+def excluded(item, topic):
+    """The topic's own exclusion list, applied to the title before anything is spent on
+    the item. Word-boundary matched so "hack" does not kill "Hacking the Godot renderer"."""
+    title = (item.get("title") or "").lower()
+    for raw in str(topic.get("exclusions") or "").split(","):
+        term = " ".join(raw.lower().split())
+        if len(term) < 3:
+            continue
+        # "courses" must trip the "course" exclusion; SEO titles are almost always plural.
+        if re.search(r"\b" + re.escape(term) + r"s?\b", title):
+            return term
+    return None
+
+
+def diversify(items, key, n):
+    """Pick n items, round-robin across providers and then across domains inside each.
+
+    Straight score ordering handed the whole budget to one source: GitHub is the only
+    provider reporting a discussion number (stars), so discussion_score was in practice an
+    "is this GitHub?" term and 20 of 20 judged items in one run came from github.com.
+    Round-robin on domain alone then handed it to SearXNG instead, which returns ~100
+    one-off domains per run against RSS's ~10 - so it won 17 of 20 slots with undated
+    evergreen pages while the dated feed articles got three. Balance providers first.
+
+    This only decides who gets looked at; select() still ranks on the real scores."""
+    ranked = sorted(items, key=key, reverse=True)
+    groups = OrderedDict()
+    for it in ranked:
+        prov = (it.get("providers") or ["?"])[0]
+        groups.setdefault(prov, OrderedDict()).setdefault(it.get("domain") or "?", []).append(it)
+    out = []
+    while len(out) < n:
+        before = len(out)
+        for by_domain in groups.values():
+            for dom, queue in by_domain.items():
+                if queue:
+                    out.append(queue.pop(0))
+                    by_domain.move_to_end(dom)  # next turn goes to a different domain
+                    break
+            if len(out) >= n:
+                break
+        if len(out) == before:
+            break  # everything is exhausted
+    return out
+
+
 def prefilter_score(item, topic):
     """Cheap pre-LLM triage: who gets the limited inference budget."""
-    title = (item.get("title") or "").lower()
-    kws = [k.strip().lower() for k in (topic.get("keywords") or "").split(",") if k.strip()]
-    kw_hit = sum(1 for k in kws if k and k in title)
     has_text = 1.0 if item.get("content_chars", 0) > 500 else 0.0
     return (
-        0.30 * recency_score(item)
-        + 0.20 * cross_source_score(item)
-        + 0.20 * discussion_score(item)
+        0.30 * min(1.0, topic_match(item, topic) / 5.0)
+        + 0.25 * recency_score(item)
+        + 0.15 * cross_source_score(item)
         + 0.15 * SOURCE_QUALITY.get(item.get("source_type"), 0.5)
-        + 0.10 * min(1.0, kw_hit / 2.0)
+        # Was 0.20. Only GitHub populates this, so a high weight is a GitHub subsidy.
+        + 0.10 * discussion_score(item)
         + 0.05 * has_text
     )
 

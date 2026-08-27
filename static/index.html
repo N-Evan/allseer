@@ -258,7 +258,9 @@ function renderTopics(){
       <button data-del="${t.id}">Delete</button>
     </div>
     <div class="kv"><div>keywords</div><div>${esc(t.keywords||'-')}</div>
-      <div>exclusions</div><div>${esc(t.exclusions||'-')}</div></div>
+      <div>exclusions</div><div>${esc(t.exclusions||'-')}</div>
+      ${t.feeds?`<div>pinned feeds</div><div>${esc(t.feeds)}</div>`:''}
+      ${t.providers?`<div>providers</div><div>${esc(t.providers)}</div>`:''}</div>
   </div>`).join('') || '<div class="empty">No topics yet.</div>';
 }
 

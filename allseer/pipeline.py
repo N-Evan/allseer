@@ -37,10 +37,15 @@ def phase(name):
     log("== " + name)
 
 
-def _cfg(settings):
+def _cfg(settings, topic=None):
+    # A topic may pin its own feed list. Job boards must not answer gamedev queries and
+    # gamedev feeds must not answer job queries, and rss_feeds is a single global setting.
+    feeds = (topic or {}).get("feeds") or settings.get("rss_feeds", "")
     return {
         "days_back": db.setting_int(settings, "days_back", 3),
         "searxng_url": settings.get("searxng_url", ""),
+        "rss_feeds": feeds,
+        "github_min_stars": db.setting_int(settings, "github_min_stars", 5),
     }
 
 
@@ -75,18 +80,31 @@ async def run_research(topic_ids=None, ad_hoc=None):
         finished_at=None, log=[], stats={},
     )
 
-    cfg = _cfg(settings)
     n_queries = db.setting_int(settings, "queries_per_topic", 6)
     max_fetch = db.setting_int(settings, "max_fetch", 60)
     max_llm = db.setting_int(settings, "max_llm", 35)
     n_trend = db.setting_int(settings, "top_trending", 3)
     n_niche = db.setting_int(settings, "top_niche", 5)
     provider_names = [p.strip() for p in settings.get("providers", "").split(",") if p.strip()]
+    drop_undated = db.setting_int(settings, "drop_undated", 0) == 1
+    seen_days = db.setting_int(settings, "suppress_seen_days", 21)
+    seen = db.seen_canon_urls(seen_days)
+    if seen:
+        log("suppressing " + str(len(seen)) + " links already ranked in the last "
+            + str(seen_days) + " days")
     llm = llm_mod.Ollama(settings["ollama_url"], settings["ollama_model"])
+    # Query generation is cheap and forgiving; judging and the analyst note are where a
+    # better model actually shows. Empty analysis_model means "same model for both".
+    analyst = llm_mod.Ollama(settings["ollama_url"],
+                             settings.get("analysis_model") or settings["ollama_model"])
+    if analyst.model != llm.model:
+        log("analysis model: " + analyst.model + " (queries: " + llm.model + ")")
 
     stats = {
         "topics": len(all_topics), "queries": 0, "raw_results": 0, "unique_stories": 0,
         "fetched": 0, "judged": 0, "trending": 0, "niche": 0,
+        "dropped_stale": 0, "dropped_seen": 0,
+        "dropped_offtopic": 0, "dropped_excluded": 0,
         "provider_errors": [], "llm_errors": [],
     }
     headers = {"User-Agent": settings.get("user_agent") or "allseer/0.1", "Accept-Language": "en"}
@@ -105,15 +123,27 @@ async def run_research(topic_ids=None, ad_hoc=None):
 
             for topic in all_topics:
                 STATUS["topic"] = topic["name"]
+                cfg = _cfg(settings, topic)
 
                 phase("queries for: " + topic["name"])
-                try:
-                    queries = await llm_mod.gen_queries(llm, topic, n_queries)
+                if topic.get("feeds"):
+                    # A feed-pinned topic wants the same terms searched every day, not a
+                    # fresh set of LLM angles. Job listings are titled "Senior Unity
+                    # Developer (Remote)" and only match a query that literally says
+                    # "unity developer"; an angle like "remote gameplay hiring trends"
+                    # matches nothing in a feed. The keywords ARE the queries.
+                    queries = [k.strip() for k in (topic.get("keywords") or "").split(",")
+                               if k.strip()][:n_queries * 2]
                     if not queries:
-                        raise llm_mod.LLMError("no usable queries")
-                except Exception as e:
-                    log("query generation failed (" + str(e)[:120] + ") - using templates")
-                    queries = llm_mod.fallback_queries(topic, n_queries)
+                        queries = [topic["name"]]
+                else:
+                    try:
+                        queries = await llm_mod.gen_queries(llm, topic, n_queries)
+                        if not queries:
+                            raise llm_mod.LLMError("no usable queries")
+                    except Exception as e:
+                        log("query generation failed (" + str(e)[:120] + ") - using templates")
+                        queries = llm_mod.fallback_queries(topic, n_queries)
                 if topic.get("ad_hoc"):
                     # Search what was actually typed, then the generated angles around it.
                     exact = topic["name"]
@@ -124,13 +154,52 @@ async def run_research(topic_ids=None, ad_hoc=None):
                     log("  q: " + q)
 
                 phase("searching: " + topic["name"])
+                names = [p.strip() for p in (topic.get("providers") or "").split(",")
+                         if p.strip()] or provider_names
                 results, errs = await providers.search_all(
-                    client, queries, cfg, provider_names, on_event=log
+                    client, queries, cfg, names, on_event=log
                 )
                 stats["provider_errors"].extend(errs[:10])
                 stats["raw_results"] += len(results)
+
+                # days_back used to be a hint each provider honoured differently (GitHub
+                # not at all), so 2014 repos reached a 3-day run. Enforce it here, once.
+                n_before = len(results)
+                results = [r for r in results
+                           if rank.fresh_enough(r, cfg["days_back"], drop_undated)]
+                dropped = n_before - len(results)
+                stats["dropped_stale"] += dropped
+                if dropped:
+                    log("dropped " + str(dropped) + "/" + str(n_before)
+                        + " results older than " + str(cfg["days_back"]) + " days")
+
+                if seen:
+                    n_before = len(results)
+                    results = [r for r in results if r.get("canon_url") not in seen]
+                    stats["dropped_seen"] += n_before - len(results)
+                    if n_before - len(results):
+                        log("dropped " + str(n_before - len(results))
+                            + " already shown in a recent run")
+
+                # Relevance was only ever checked by the LLM, i.e. after the fetch and
+                # the inference had already been paid for. Two cheap lexical gates first.
+                n_before = len(results)
+                results = [r for r in results if not rank.excluded(r, topic)]
+                stats["dropped_excluded"] += n_before - len(results)
+                if n_before - len(results):
+                    log("dropped " + str(n_before - len(results))
+                        + " matching this topic's exclusions")
+
+                n_before = len(results)
+                results = [r for r in results if rank.on_topic(r, topic)]
+                stats["dropped_offtopic"] += n_before - len(results)
+                if n_before - len(results):
+                    log("dropped " + str(n_before - len(results))
+                        + " carrying no real topic vocabulary")
+
                 if not results:
-                    log("no results for this topic - check providers/network")
+                    log("no fresh results for this topic - widen days_back, "
+                        "lower suppress_seen_days, or check providers/network")
                     continue
 
                 phase("deduplicating: " + topic["name"])
@@ -143,29 +212,49 @@ async def run_research(topic_ids=None, ad_hoc=None):
                 log(str(len(results)) + " results -> " + str(len(reps)) + " distinct stories")
 
                 phase("fetching content: " + topic["name"])
-                reps.sort(key=lambda i: rank.prefilter_score(i, topic), reverse=True)
-                to_fetch = reps[:max_fetch]
+                to_fetch = rank.diversify(
+                    reps, lambda i: rank.prefilter_score(i, topic), max_fetch)
                 await extract.fetch_many(client, to_fetch, on_event=log)
                 got = sum(1 for i in to_fetch if i.get("content_chars", 0) > 400)
                 stats["fetched"] += got
                 log("extracted readable text from " + str(got) + "/" + str(len(to_fetch)))
 
+                # trafilatura fills published_at for pages the search API left undated, so
+                # some items only reveal they are ancient after the fetch. Re-check.
+                n_before = len(reps)
+                reps = [r for r in reps if rank.fresh_enough(r, cfg["days_back"], drop_undated)]
+                if n_before - len(reps):
+                    stats["dropped_stale"] += n_before - len(reps)
+                    log("dropped " + str(n_before - len(reps))
+                        + " more after the page revealed its real date")
+                if not reps:
+                    continue
+
                 phase("scoring with LLM: " + topic["name"])
-                reps.sort(key=lambda i: rank.prefilter_score(i, topic), reverse=True)
-                shortlist = reps[:max_llm]
+                # Judge only what we actually tried to fetch: the post-fetch freshness
+                # re-gate reshuffles reps, and an unfetched item would be judged on its
+                # search snippet alone.
+                tried = {id(i) for i in to_fetch}
+                pool = [r for r in reps if id(r) in tried] or reps
+                shortlist = rank.diversify(
+                    pool, lambda i: rank.prefilter_score(i, topic), max_llm)
+                log("judging " + str(len(shortlist)) + " items from "
+                    + str(len({i.get("domain") for i in shortlist})) + " domains")
                 for n, it in enumerate(shortlist, 1):
                     log("judging " + str(n) + "/" + str(len(shortlist)) + ": "
                         + (it.get("title") or "")[:70])
                     try:
-                        it.update(await llm_mod.judge(llm, it, topic))
+                        it.update(await llm_mod.judge(analyst, it, topic))
                         stats["judged"] += 1
                     except Exception as e:
                         msg = "judge failed: " + type(e).__name__ + ": " + str(e)[:120]
                         stats["llm_errors"].append(msg)
                         log(msg)
                     rank.score(it)
-                for it in reps[max_llm:]:
-                    rank.score(it)
+                judged = {id(i) for i in shortlist}
+                for it in reps:
+                    if id(it) not in judged:
+                        rank.score(it)
 
                 phase("ranking: " + topic["name"])
                 trending, niche = rank.select(shortlist, n_trend, n_niche)
@@ -185,7 +274,7 @@ async def run_research(topic_ids=None, ad_hoc=None):
                     if not iid:
                         continue
                     try:
-                        db.set_deep_analysis(iid, await llm_mod.deep_analyze(llm, it, topic))
+                        db.set_deep_analysis(iid, await llm_mod.deep_analyze(analyst, it, topic))
                         log("analysed: " + (it.get("title") or "")[:60])
                     except Exception as e:
                         log("deep analysis failed: " + type(e).__name__ + ": " + str(e)[:120])

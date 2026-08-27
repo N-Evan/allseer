@@ -146,8 +146,10 @@ def add_topic(body: dict):
     try:
         with con:
             con.execute(
-                "INSERT INTO topics(name,keywords,exclusions,enabled) VALUES(?,?,?,?)",
+                "INSERT INTO topics(name,keywords,exclusions,feeds,providers,enabled)"
+                " VALUES(?,?,?,?,?,?)",
                 (name, body.get("keywords", ""), body.get("exclusions", ""),
+                 body.get("feeds", ""), body.get("providers", ""),
                  1 if body.get("enabled", True) else 0),
             )
     except Exception as e:
@@ -163,8 +165,10 @@ def update_topic(topic_id: int, body: dict):
     with con:
         con.execute(
             "UPDATE topics SET name=COALESCE(?,name), keywords=COALESCE(?,keywords), "
-            "exclusions=COALESCE(?,exclusions), enabled=COALESCE(?,enabled) WHERE id=?",
+            "exclusions=COALESCE(?,exclusions), feeds=COALESCE(?,feeds), "
+            "providers=COALESCE(?,providers), enabled=COALESCE(?,enabled) WHERE id=?",
             (body.get("name"), body.get("keywords"), body.get("exclusions"),
+             body.get("feeds"), body.get("providers"),
              None if "enabled" not in body else (1 if body["enabled"] else 0), topic_id),
         )
     con.close()

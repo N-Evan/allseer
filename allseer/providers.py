@@ -8,6 +8,8 @@ import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
+from urllib.parse import urlsplit
+
 from .dedupe import canon_url, domain_of
 
 NEWSY = re.compile(
@@ -19,6 +21,29 @@ PAPERS = re.compile(
     r"(arxiv\.org|openreview|acm\.org|ieee|nature\.com|science\.org|biorxiv|ssrn)", re.I
 )
 BLOGGY = re.compile(r"(blog|substack|medium|dev\.to|hashnode|ghost\.io|\.io$|\.dev$)", re.I)
+# Editorial gamedev/AI outlets: a feed item from these is a real article, not "other".
+FEEDY = re.compile(
+    r"(80\.lv|gamedeveloper\.com|gamesindustry\.biz|gamefromscratch|indiedb|"
+    r"godotengine\.org|unrealengine\.com|unity\.com|itch\.io|huggingface\.co|gdcvault)", re.I
+)
+
+
+# Social walled gardens and reference pages. They are never the research artefact - they
+# are a link to it - and every one of them either blocks the fetch or has no extractable
+# text. A single "Indie Games & Devlogs" run pulled 12 facebook, 8 linkedin, 5 instagram,
+# 4 x.com and 4 wikipedia results out of SearXNG, all of which reached dedupe and the fetch
+# budget before dying. Drop them where results are built, not where they are fetched.
+JUNK = re.compile(
+    r"^(www\.)?("
+    r"facebook\.com|m\.facebook\.com|instagram\.com|threads\.net|"
+    r"linkedin\.com|[a-z]{2}\.linkedin\.com|"
+    r"x\.com|twitter\.com|t\.co|nitter\.[a-z.]+|"
+    r"tiktok\.com|pinterest\.[a-z.]+|quora\.com|"
+    r"[a-z]{2}\.wikipedia\.org|wikipedia\.org|wikimedia\.org|"
+    r"podcasts\.apple\.com|open\.spotify\.com|soundcloud\.com|"
+    r"fastercapital\.com|slideshare\.net|scribd\.com|coursehero\.com"
+    r")$", re.I,
+)
 
 
 def classify_source(url: str, provider: str) -> str:
@@ -33,8 +58,10 @@ def classify_source(url: str, provider: str) -> str:
         return "paper"
     if NEWSY.search(d):
         return "news"
-    if BLOGGY.search(d):
+    if BLOGGY.search(d) or FEEDY.search(d):
         return "blog"
+    if provider == "rss":
+        return "blog"  # it publishes a feed, so it is a publication
     return "other"
 
 
@@ -46,10 +73,28 @@ def _iso(dt):
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def _norm_date(value):
+    """Store every date as ISO-8601 UTC. Feeds hand back RFC-2822 ("Thu, 27 Aug 2026 ..."),
+    which parse_date understands but SQL ordering and the UI do not."""
+    if not value:
+        return None
+    from .rank import parse_date  # local: rank imports this module
+    d = parse_date(value)
+    return _iso(d) if d else str(value)
+
+
 def _result(url, title, provider, query, snippet="", published=None, author=None, discussion=0):
     if not url or not title:
         return None
     cu = canon_url(url)
+    if JUNK.match(domain_of(cu) or ""):
+        return None
+    # A bare site root is a publication, not a story. SearXNG answers "indie devlog" with
+    # site homepages, which arrive undated and won four niche slots in one run
+    # ("The Llama Concept", "Emanschi Games"). Every real artefact has a path.
+    if cu and urlsplit(cu).path in ("", "/") and not urlsplit(cu).query:
+        return None
+    published = _norm_date(published)
     return {
         "url": url,
         "canon_url": cu,
@@ -98,7 +143,7 @@ class Throttle:
         return False
 
 
-REDDIT_THROTTLE = Throttle(6.0)
+REDDIT_THROTTLE = Throttle(12.0)
 ARXIV_THROTTLE = Throttle(3.0)
 
 
@@ -177,13 +222,20 @@ async def reddit(client, query, cfg):
 
 
 async def github(client, query, cfg):
-    since = (datetime.now(timezone.utc) - timedelta(days=max(cfg["days_back"], 14))).date()
+    # created:, not pushed:. A 2014 repo pushed today is not a new find, and pushed:>
+    # was the single reason 2014-2023 repos kept winning slots in a days_back=3 run.
+    since = (datetime.now(timezone.utc) - timedelta(days=cfg["days_back"])).date()
+    # created:> alone floods the results with day-old empty repos. A repo that picked up a
+    # handful of stars in its first days has actual traction; this cut 15925 matches to 90
+    # without displacing a single relevant one.
+    stars = int(cfg.get("github_min_stars") or 0)
+    bar = (" stars:>=" + str(stars)) if stars > 0 else ""
     data = await _json(
         client,
         "https://api.github.com/search/repositories",
         # Relevance order beats "recently pushed" here, and the in: qualifier stops GitHub
         # from OR-ing the words together and returning unrelated repos.
-        params={"q": query + " in:name,description,readme pushed:>" + str(since),
+        params={"q": query + " in:name,description,readme created:>" + str(since) + bar,
                 "per_page": 12},
         headers={"Accept": "application/vnd.github+json"},
     )
@@ -259,10 +311,132 @@ async def searxng(client, query, cfg):
     return out
 
 
-REGISTRY = {"hn": hn, "reddit": reddit, "github": github, "arxiv": arxiv, "searxng": searxng}
+# --- rss -------------------------------------------------------------------
+# The highest-signal sources for gamedev/devlog content publish feeds, not APIs. One
+# generic provider covers all of them: add a URL to the rss_feeds setting, nothing else.
+FEED_UA = REDDIT_UA  # plain UAs get 403 from a few CDNs
+_FEED_CACHE = {}     # url -> (monotonic_fetched_at, [entry dicts])
+_FEED_LOCKS = {}
+FEED_TTL = 900.0     # a feed does not change meaningfully inside a run
+FEED_CAP = 10        # best-matching entries kept per feed per query
+
+
+def _feed_text(el, *names):
+    """RSS and Atom disagree on every tag name; try both namespaced and bare."""
+    for n in names:
+        for tag in (n, "{http://www.w3.org/2005/Atom}" + n):
+            v = el.findtext(tag)
+            if v and v.strip():
+                return v.strip()
+    return ""
+
+
+def parse_feed(text):
+    """RSS 2.0 <item> or Atom <entry> -> list of {url,title,snippet,published,author}."""
+    root = ET.fromstring(text.encode("utf-8", "ignore") if isinstance(text, str) else text)
+    nodes = root.iter("item")
+    entries = list(nodes)
+    if not entries:
+        entries = list(root.iter("{http://www.w3.org/2005/Atom}entry"))
+    out = []
+    for e in entries:
+        url = _feed_text(e, "link", "guid", "id")
+        if not url.startswith("http"):
+            url = ""
+            for ln in e.iter("{http://www.w3.org/2005/Atom}link"):
+                if (ln.get("rel") or "alternate") == "alternate" and ln.get("href"):
+                    url = ln.get("href")
+                    break
+        body = _feed_text(e, "description", "summary", "content",
+                          "{http://purl.org/rss/1.0/modules/content/}encoded")
+        out.append({
+            "url": url,
+            "title": _feed_text(e, "title"),
+            "snippet": re.sub(r"<[^>]+>", " ", body),
+            "published": _feed_text(e, "pubDate", "published", "updated",
+                                    "{http://purl.org/dc/elements/1.1/}date") or None,
+            "author": _feed_text(e, "author", "creator",
+                                 "{http://purl.org/dc/elements/1.1/}creator") or None,
+        })
+    return out
+
+
+async def _get_feed(client, url):
+    """Fetch+parse once per URL per run. reddit.com shares the reddit throttle."""
+    loop = asyncio.get_running_loop()
+    lock = _FEED_LOCKS.setdefault(url, asyncio.Lock())
+    async with lock:
+        hit = _FEED_CACHE.get(url)
+        if hit and loop.time() - hit[0] < FEED_TTL:
+            return hit[1]
+        if "reddit.com" in url:
+            async with REDDIT_THROTTLE:
+                r = await client.get(url, headers={"User-Agent": FEED_UA})
+        else:
+            r = await client.get(url, headers={"User-Agent": FEED_UA})
+        r.raise_for_status()
+        entries = parse_feed(r.text)
+        _FEED_CACHE[url] = (loop.time(), entries)
+        return entries
+
+
+def feed_match_count(query, title, snippet):
+    """How many of the query's distinctive words the entry contains.
+
+    A feed is not searchable, so filtering happens locally on the entry text. Any-one-word
+    matching let "agentic system tool use" pull 103 gamedev articles that merely said
+    "tool", so a query with three or more distinctive words needs two of them. Returns the
+    count (0 = no match) so the caller can also rank by it. Deliberately loose past the
+    threshold - the topic gate and the LLM judge are the real filters."""
+    hay = (title + " " + snippet).lower()
+    words = {w for w in re.split(r"\W+", query.lower()) if len(w) > 3 and w not in FEED_STOP}
+    if not words:
+        return 1
+    need = 2 if len(words) >= 3 else 1
+    hits = sum(1 for w in words if w in hay)
+    return hits if hits >= need else 0
+
+
+def feed_matches(query, title, snippet):
+    return feed_match_count(query, title, snippet) > 0
+
+
+FEED_STOP = {"what", "when", "with", "from", "this", "that", "your", "than", "then", "into",
+             "best", "news", "latest", "recent", "using", "about", "over", "very", "more",
+             "most", " how", "does", "will", "have", "been", "they", "them", "some", "make"}
+
+
+async def rss(client, query, cfg):
+    urls = [u.strip() for u in re.split(r"[,\s]+", cfg.get("rss_feeds") or "") if u.strip()]
+    if not urls:
+        return []
+    got = await asyncio.gather(*(_get_feed(client, u) for u in urls), return_exceptions=True)
+    out = []
+    for u, entries in zip(urls, got):
+        if isinstance(entries, BaseException):
+            continue  # one dead feed must not take the provider down
+        # "solo developer game jam insights" matched 80 entries in one run, because on a
+        # gamedev feed every article contains "game" and "developer". Take the best-matching
+        # FEED_CAP per feed per query instead of the whole feed.
+        scored = []
+        for e in entries:
+            n = feed_match_count(query, e["title"], e["snippet"])
+            if n:
+                scored.append((n, e))
+        scored.sort(key=lambda x: -x[0])
+        for _, e in scored[:FEED_CAP]:
+            out.append(_result(e["url"], e["title"], "rss", query,
+                               snippet=e["snippet"], published=e["published"],
+                               author=e["author"] or domain_of(u)))
+    return out
+
+
+REGISTRY = {"hn": hn, "reddit": reddit, "github": github, "arxiv": arxiv,
+            "searxng": searxng, "rss": rss}
 
 # Unauthenticated quotas are the binding constraint: reddit tolerates only a couple of
 # requests per run, GitHub search allows ~10/min. Spend the query budget where it is free.
+# rss re-uses one cached fetch per feed, so extra queries there are nearly free.
 QUERY_CAP = {"reddit": 2, "github": 5}
 
 

@@ -56,10 +56,127 @@ Headless: `python run.py --once`. Tests: `python tests/test_core.py`.
   `QUERY_CAP["github"] = 5`. Use `created_at` as the date, not `pushed_at` - a 2019 repo
   pushed today is not a new find. Stars are a lifetime total, so `DISCUSSION_CAP["github"]`
   is 8000 vs 1000-1500 elsewhere.
+  **The query filters on `created:>`, not `pushed:>`.** `pushed:>` was the single cause of
+  2014-2023 repos winning slots in a `days_back=3` run: it selected on push activity while
+  reporting `created_at` as the date. Measured on 822 rows: **every single old ranked item
+  came from GitHub.** Do not put `pushed:>` back.
+- **Reddit is not usable unauthenticated.** It serves exactly one request then 429s every
+  following one for minutes - both `search.rss` and `/r/<sub>/top.rss`. The `reddit`
+  provider still exists but is OFF in the default provider list; subreddit `top.rss` feeds
+  go through `rss` instead, behind a 12s throttle. OAuth (free script app) is the real fix.
+- **`rss` provider**: one generic provider over the `rss_feeds` setting covers 80.lv,
+  gamedeveloper.com, gamesindustry.biz, godotengine.org, itch.io, huggingface, and
+  subreddit feeds. Feeds are the best gamedev/devlog source - complete, dated, unmetered.
+  Each URL is fetched once per run (`_FEED_CACHE`, 900s TTL), so extra queries are free.
+  RSS and Atom disagree on every tag name; `_feed_text()` tries both, and Atom `<link>` has
+  no text, only `href`. Local filtering: any query word >3 chars must appear in title or
+  summary. LinkedIn has no feed and blocks fetches - it cannot be a provider.
 - **HN Algolia** works well, but a narrow query often has nothing inside the freshness
   window, so the provider retries without `numericFilters` when the filtered call is empty.
 - `_json()` rejects a 200 whose content-type is not JSON - that is how blocked/interstitial
   responses show up.
+- **SearXNG ships with the JSON API disabled.** A stock instance answers `?format=json`
+  with `403 Forbidden` (an HTML body), which surfaces as `expected JSON, got text/html`.
+  Fix is in the *instance*, not allseer: add `search: {formats: [html, json]}` to its
+  `settings.yml` and restart. This machine's instance is at `http://127.0.0.1:1991`, Docker
+  container `searxng-core`, config bind-mounted from `<your searxng config dir>`.
+  SearXNG results essentially never carry `publishedDate`, so they arrive undated.
+
+## Freshness is enforced centrally, not per provider
+
+`days_back` used to be only a hint each provider interpreted its own way, and nothing
+downstream re-checked. `NICHE_WEIGHTS` has **no recency term at all**, so a stale item with
+good novelty/depth won a niche slot outright. `rank.fresh_enough(item, days_back,
+drop_unknown)` is now the one gate, applied twice per topic in `pipeline.py`:
+
+1. right after `search_all` - kills known-stale results before they cost a fetch or a judge call
+2. right after `extract.fetch_many` - trafilatura fills `published_at` for pages the search
+   API left undated, so some items only reveal they are ancient after the fetch
+
+Undated items are KEPT by default (many good pages publish no date) and scored as ~72h old.
+`drop_undated=1` makes the gate strict; it costs most SearXNG hits.
+
+`suppress_seen_days` (default 21) skips any `canon_url` already promoted to a bucket in a
+recent run - `db.seen_canon_urls()`. Without it the same evergreen repo was re-promoted
+every run, which is what made the output look stale even when the sources had moved on.
+Note `UNIQUE(run_id, canon_url)` only ever deduped *within* a run.
+
+## The server serves the code it started with (2026-08-28)
+
+`uvicorn.run()` in `run.py` has **no `--reload`**. A dashboard left running across an edit
+keeps serving the modules it imported at startup. This cost a whole debugging session: the
+"Indie Games & Devlogs" run that produced a 2016 repo as its top result was made by a
+process started at 19:53, hours before the fixes it was supposed to contain. On that old
+code `rss` was not in `REGISTRY`, so `REGISTRY.get("rss")` returned `None` and the provider
+was **skipped without raising**, and the GitHub query still said `pushed:>`.
+
+**Diagnose it from the stats blob, not the code.** A run's `stats` must contain
+`dropped_stale`, `dropped_seen`, `dropped_offtopic`, `dropped_excluded`. Missing keys mean
+the process predates the code on disk. Kill and restart before believing any run.
+
+## Retrieval quality: what actually went wrong (2026-08-28)
+
+The failing run, measured: 190 items, of which **20 of 20 judged were github.com**, and
+searxng contributed 140 results led by facebook 12, linkedin 8, reddit 8, x 4, wikipedia 4.
+Three separate causes, all of which survive a restart:
+
+- **`discussion_score` was an "is this GitHub?" term.** GitHub is the only provider that
+  reports a number there (stars); searxng, rss, arxiv and reddit-RSS all send `discussion=0`.
+  At weight 0.20 in `prefilter_score` a 48k-star repo scored 0.96 while everything else
+  scored 0. Weight is now 0.10 and topic match carries 0.30.
+- **Nothing checked relevance before the LLM.** `exclusions` were only ever used *inside*
+  the judge prompt, i.e. after the fetch and the inference were already paid for. A run for
+  indie devlogs fetched scope.riege.com (freight), forums.scopeusers.com and ajtmh.org
+  (tropical medicine), all matched on the word "scope". `rank.excluded()` and
+  `rank.on_topic()` now gate before the fetch.
+- **No source quota.** `select()` caps per domain, but by then the shortlist was already
+  all GitHub. `rank.diversify()` now round-robins **providers first, then domains** when
+  choosing who gets fetched and judged. Domain-only round-robin was tried first and simply
+  moved the monopoly to SearXNG, which returns ~100 one-off domains per run vs RSS's ~10.
+
+`providers.JUNK` drops the social walled gardens where results are built, not where they
+are fetched - `extract.SKIP_HOSTS` only skipped the download, so they still ate dedupe and
+fetch slots. Do not merge the two lists: SKIP_HOSTS is about "cannot extract text",
+JUNK is about "is never the artefact".
+
+A bare site root is dropped in `_result()` too: SearXNG returns homepages for topical
+queries, they arrive undated, and four of them (`thellamaconcept.com`,
+`emanschigames.com`, `magnate-games.itch.io`) took niche slots in the 05:08 run.
+Every real artefact has a path; a query string counts as one.
+
+`rank.excluded()` matches the title with `\b<term>s?\b`. The optional plural is load-bearing
+(SEO titles say "Courses", "Jobs"); the word boundary is too ("Hacking the Godot renderer"
+must survive the `hack` exclusion).
+
+## Per-topic overrides (2026-08-28)
+
+`topics` gained two columns, both empty by default, both migrated in `db.init()`:
+
+- **`feeds`** - overrides `rss_feeds` for this topic. Setting it also switches query
+  generation off: the topic's `keywords` become the queries verbatim. A job listing is
+  titled "Senior Unity Developer (Remote)" and only matches a query that literally says
+  `unity developer`; an LLM angle like "remote gameplay hiring trends" matches nothing.
+- **`providers`** - overrides the global `providers` for this topic.
+
+## Topic 9: Remote Jobs: Software & Game Dev (2026-08-28)
+
+Remote/worldwide, general software + game dev, listings **and** hunting strategy in one
+topic. `providers = rss,searxng` - arXiv, GitHub and HN returned "solar eruption analyses"
+and Show HN posts for `platform engineer` when left enabled, because diversify gives every
+enabled provider an equal share.
+
+Feeds verified live 2026-08-28 (parse + fresh dated entries): weworkremotely 89,
+himalayas 100, jobicy 200, remotive 20, hnrss/jobs 20, plus Pragmatic Engineer and
+r/cscareerquestions, r/gamedevjobs, r/experienceddevs for the strategy half.
+**Dead - do not re-add without checking `parse_feed()` first:** remoteok.com,
+workingnomads.com, gamesindustry.biz/jobs and stackoverflow.com/jobs all serve malformed
+XML; rss.app/hitmarker is not XML at all.
+
+The topic uses `_JOB_NOISE`, **not** `_NOISE`. `_NOISE` excludes "hiring, job posting,
+salary" - the entire subject of this topic. `_JOB_NOISE` instead screens the scams
+(rev-share, unpaid, commission only), the wrong roles (virtual assistant, data entry) and
+the SEO listicles that rank for every role term ("courses", "academy", "how to become",
+"salary guide").
 
 ## Windows facts
 
@@ -83,6 +200,37 @@ Headless: `python run.py --once`. Tests: `python tests/test_core.py`.
 - Clustering is an O(n^2) title comparison - fine at a few hundred items per run.
 - Reddit items have no discussion signal (RSS limitation). OAuth would restore it.
 - Both throttles are global, not per-host.
+- `rss` feed match is a bare substring test, not stemming or embeddings. The LLM judge is
+  the real filter; tighten only if noise actually reaches the buckets.
+- Reddit feeds sit behind a 12s throttle, so ~6 of them add ~70s to the first run that
+  touches them (cached for the rest of the run).
+
+## Topics (Aug 28 2026 - rewritten from the owner's stated interests)
+
+Eight topics, seeded in `db.SEED_TOPICS` and live in the DB. Two shared exclusion blocks do
+the heavy lifting:
+
+- `_NOISE` - money/career/listicle noise that follows any tech query. On every topic.
+- `_GAME_NOISE` - game *coverage* rather than game *craft*: trailers, release dates,
+  review scores, sales, esports, leaks. On the five game topics only. It exists because a
+  "Grand Theft Auto 6 teaser debuts on Netflix" item won a NICHE slot in a Level & Systems
+  Design run. Coverage is not craft.
+
+| Topic | Covers |
+|---|---|
+| Local AI & Inference | local llm, ollama, llama.cpp, gguf, quantization, vllm, mlx |
+| Agentic Systems & Harnesses | agentic, harnesses, mcp, tool use, context engineering, coding agents |
+| Software Engineering | architecture, refactoring, profiling, systems, testing, postmortems |
+| Game Engines & Tech | godot, unreal, unity, bevy, ecs, renderer, shader, tooling |
+| Gameplay Programming | controllers, behavior trees, navmesh, netcode, procgen, game feel |
+| Level & Systems Design | blockout, encounter design, pacing, spatial storytelling, economy |
+| Game Writing & Narrative | narrative design, branching dialogue, ink/yarn, quest design |
+| Indie Games & Devlogs | devlogs, solo dev, postmortems, game jams, scope, marketing |
+| Remote Jobs: Software & Game Dev | pinned job-board feeds + strategy feeds; own providers and exclusions |
+
+Eight topics x 5 queries x 5 providers is a long run. Run a subset by `topic_ids`, or drop
+`queries_per_topic`, when iterating.
+
 
 ## Where things are
 
