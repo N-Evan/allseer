@@ -3,6 +3,8 @@ its search snippet and just scores lower on depth."""
 import asyncio
 import json
 
+from . import db
+
 try:
     import trafilatura
 except ImportError:  # snippet-only mode still works
@@ -62,13 +64,45 @@ async def fetch_one(client, item, sem):
     return item
 
 
-async def fetch_many(client, items, on_event=None, concurrency=8):
+def _apply_cached(item, row):
+    text = row.get("content") or ""
+    item["content"] = text
+    item["content_chars"] = len(text)
+    if row.get("published_at") and not item.get("published_at"):
+        item["published_at"] = row["published_at"]
+    if row.get("author") and not item.get("author"):
+        item["author"] = row["author"]
+    item["fetch_note"] = "cached"
+    return item
+
+
+async def fetch_many(client, items, on_event=None, concurrency=8, cache_days=0):
+    """Downloads only what is not already in page_cache.
+
+    max_fetch is 40 a topic and at most 8 items get promoted, so nearly every fetch
+    budget was being spent re-downloading pages an earlier run had already read. Text
+    at a URL does not change on the timescale that matters here.
+    """
+    hits = db.cached_pages([it.get("canon_url") for it in items], cache_days)
+    todo = []
+    for it in items:
+        row = hits.get(it.get("canon_url"))
+        if row is None:
+            todo.append(it)
+        else:
+            _apply_cached(it, row)
+    if hits and on_event:
+        on_event("reused " + str(len(items) - len(todo)) + "/" + str(len(items))
+                 + " pages from the cache")
+
     sem = asyncio.Semaphore(concurrency)
     done = 0
     out = []
-    for coro in asyncio.as_completed([fetch_one(client, it, sem) for it in items]):
+    for coro in asyncio.as_completed([fetch_one(client, it, sem) for it in todo]):
         out.append(await coro)
         done += 1
         if on_event and done % 5 == 0:
-            on_event("fetched " + str(done) + "/" + str(len(items)))
-    return out
+            on_event("fetched " + str(done) + "/" + str(len(todo)))
+    if cache_days and out:
+        db.cache_pages(out)
+    return items

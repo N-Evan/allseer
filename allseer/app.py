@@ -94,7 +94,9 @@ def results(run_id: int | None = None, day: str | None = None, topic_id: int | N
     elif day:
         where.append("r.day=?")
         args.append(day)
-    else:
+    elif not q:
+        # A search is over your whole history; only an unsearched view defaults to
+        # "the latest run", which is what made past runs unreachable.
         latest = con.execute(
             "SELECT id FROM runs WHERE status='done' ORDER BY id DESC LIMIT 1").fetchone()
         if latest:
@@ -109,14 +111,21 @@ def results(run_id: int | None = None, day: str | None = None, topic_id: int | N
     elif bucket != "all":
         where.append("i.bucket!=''")
     if q:
-        where.append("(i.title LIKE ? OR i.llm_summary LIKE ? OR i.llm_why LIKE ? "
-                     "OR i.domain LIKE ? OR i.llm_tags LIKE ?)")
-        args += ["%" + q + "%"] * 5
+        # LIKE '%x%' cannot use an index and scanned every row of every run. FTS5 is a
+        # real index over title/snippet/summary/tags/domain; db.fts_query() makes
+        # arbitrary typed text a valid MATCH expression.
+        match = db.fts_query(q)
+        if match:
+            where.append("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)")
+            args.append(match)
     sql = (
-        "SELECT i.*, r.day FROM items i JOIN runs r ON r.id=i.run_id WHERE "
+        "SELECT i.*, r.day, f.vote FROM items i JOIN runs r ON r.id=i.run_id"
+        " LEFT JOIN feedback f ON f.canon_url=i.canon_url WHERE "
         + " AND ".join(where)
-        + " ORDER BY CASE i.bucket WHEN 'trending' THEN 0 WHEN 'niche' THEN 1 ELSE 2 END,"
-          " i.rank, MAX(i.trending_score, i.niche_score) DESC LIMIT ?"
+        + (" ORDER BY i.run_id DESC, i.rank" if (q and not run_id and not day) else
+           " ORDER BY CASE i.bucket WHEN 'trending' THEN 0 WHEN 'niche' THEN 1 ELSE 2 END,"
+           " i.rank, MAX(i.trending_score, i.niche_score) DESC")
+        + " LIMIT ?"
     )
     rows = con.execute(sql, args + [max(1, min(limit, 500))]).fetchall()
     con.close()
@@ -127,7 +136,8 @@ def results(run_id: int | None = None, day: str | None = None, topic_id: int | N
 def item(item_id: int):
     con = db.connect()
     r = con.execute(
-        "SELECT i.*, r.day FROM items i JOIN runs r ON r.id=i.run_id WHERE i.id=?",
+        "SELECT i.*, r.day, f.vote FROM items i JOIN runs r ON r.id=i.run_id"
+        " LEFT JOIN feedback f ON f.canon_url=i.canon_url WHERE i.id=?",
         (item_id,)).fetchone()
     con.close()
     if not r:
@@ -182,6 +192,33 @@ def delete_topic(topic_id: int):
         con.execute("DELETE FROM topics WHERE id=?", (topic_id,))
     con.close()
     return {"ok": True}
+
+
+@app.post("/api/feedback")
+def feedback(body: dict):
+    """{"item_id": 12, "vote": 1 | -1 | 0}. Keyed by the link, not the run: the next run
+    biases its fetch and inference budget with it, bans domains you keep rejecting, and
+    shows the judge your recent verdicts as examples."""
+    try:
+        item_id = int(body.get("item_id"))
+        value = int(body.get("vote"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "item_id and vote (1, -1 or 0) required")
+    out = db.vote(item_id, value)
+    if out is None:
+        raise HTTPException(404, "no such item")
+    return out
+
+
+@app.get("/api/feedback")
+def feedback_summary(topic_id: int | None = None):
+    net = db.domain_votes(topic_id)
+    liked, disliked = db.feedback_examples(topic_id)
+    return {
+        "domains": sorted(({"domain": d, "net": n} for d, n in net.items() if n),
+                          key=lambda x: x["net"]),
+        "liked": liked, "disliked": disliked,
+    }
 
 
 @app.post("/api/settings")

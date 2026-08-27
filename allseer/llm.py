@@ -156,12 +156,31 @@ Keep "summary" and "facts" strictly to what the text supports - no speculation t
 Put all interpretation in "why_matters". Prefer [] to inventing facts."""
 
 
-async def judge(llm, item, topic):
+def _examples_block(examples):
+    """Your own past verdicts, as few-shot calibration.
+
+    The scoring guide is generic; these are the only part of the prompt that knows
+    what *you* consider a good find. Titles only - a full example item each would
+    blow a local model's context window for no extra signal.
+    """
+    liked, disliked = examples or ([], [])
+    if not liked and not disliked:
+        return ""
+    out = "\nYOUR PAST VERDICTS ON THIS TOPIC - calibrate against them:\n"
+    if liked:
+        out += "Rated USEFUL:\n" + "".join("  + " + str(t)[:110] + "\n" for t in liked)
+    if disliked:
+        out += ("Rated JUNK (score these low and mark off_topic when they recur):\n"
+                + "".join("  - " + str(t)[:110] + "\n" for t in disliked))
+    return out
+
+
+async def judge(llm, item, topic, examples=None):
     body = item.get("content") or item.get("snippet") or ""
     user = (
         "TOPIC: " + topic["name"] + "\n"
         "TOPIC KEYWORDS: " + (topic.get("keywords") or "-") + "\n"
-        "EXCLUDE IF ABOUT: " + (topic.get("exclusions") or "-") + "\n\n"
+        "EXCLUDE IF ABOUT: " + (topic.get("exclusions") or "-") + "\n" + _examples_block(examples) + "\n"
         "SOURCE TYPE: " + str(item.get("source_type")) + "\n"
         "DOMAIN: " + str(item.get("domain")) + "\n"
         "TITLE: " + str(item.get("title")) + "\n"

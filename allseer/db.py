@@ -65,6 +65,45 @@ CREATE INDEX IF NOT EXISTS idx_items_run ON items(run_id);
 CREATE INDEX IF NOT EXISTS idx_items_bucket ON items(bucket, trending_score, niche_score);
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+
+-- Your verdict on a link, keyed by canon_url so it survives the run that found it.
+-- One vote per link: voting again overwrites.
+CREATE TABLE IF NOT EXISTS feedback (
+  canon_url TEXT PRIMARY KEY,
+  domain TEXT,
+  topic_id INTEGER,
+  title TEXT,
+  vote INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_domain ON feedback(domain, vote);
+
+-- Extracted page text, reused across runs. max_fetch is 40 and only 8 items get promoted,
+-- so most of every fetch budget is spent re-downloading pages a previous run already read.
+CREATE TABLE IF NOT EXISTS page_cache (
+  canon_url TEXT PRIMARY KEY,
+  content TEXT,
+  published_at TEXT,
+  author TEXT,
+  fetched_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Full-text index over every run, so history is searchable. External-content table: the
+-- rows live in items, this only holds the index. Rebuilt from items when empty.
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+  title, snippet, llm_summary, llm_tags, domain,
+  content='items', content_rowid='id', tokenize='porter unicode61'
+);
+-- Only INSERT and DELETE: insert_items writes every indexed column at once, and the one
+-- later UPDATE (set_deep_analysis) touches a column that is not indexed.
+CREATE TRIGGER IF NOT EXISTS items_fts_ai AFTER INSERT ON items BEGIN
+  INSERT INTO items_fts(rowid, title, snippet, llm_summary, llm_tags, domain)
+  VALUES (new.id, new.title, new.snippet, new.llm_summary, new.llm_tags, new.domain);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, title, snippet, llm_summary, llm_tags, domain)
+  VALUES ('delete', old.id, old.title, old.snippet, old.llm_summary, old.llm_tags, old.domain);
+END;
 """
 
 # Feeds beat search APIs for gamedev/devlog material: they are complete, dated and free.
@@ -122,6 +161,9 @@ DEFAULT_SETTINGS = {
     "drop_undated": "0",        # 1 = an item with no publish date is discarded, not kept
     "suppress_seen_days": "21", # skip anything already ranked in a run this recent; 0 = off
     "github_min_stars": "5",    # a repo this new needs some traction to be worth a slot; 0 = off
+    "page_cache_days": "14",    # reuse extracted page text this recent instead of refetching; 0 = off
+    "dislike_drop": "3",        # net downvotes that ban a domain outright; 0 = never ban
+    "digest_dir": "digests",    # markdown digest written after every run; blank = off
     "providers": "hn,reddit,github,arxiv,searxng,rss",
     "rss_feeds": " ".join(DEFAULT_FEEDS),
     "user_agent": "allseer/0.1 (personal research agent)",
@@ -258,6 +300,14 @@ def init():
             " VALUES(?,?,?,?,?)",
             JOB_TOPIC,
         )
+        # A database that predates the index has rows in items and an empty index.
+        # Count the shadow table, NOT items_fts: an external-content table reads its
+        # column values straight from items, so "SELECT ... FROM items_fts" reports
+        # every row even when nothing is indexed and no MATCH can find anything.
+        n_items = con.execute("SELECT count(*) FROM items").fetchone()[0]
+        n_indexed = con.execute("SELECT count(*) FROM items_fts_docsize").fetchone()[0]
+        if n_items and n_indexed != n_items:
+            con.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
     con.close()
 
 
@@ -378,3 +428,130 @@ def set_deep_analysis(item_id, text):
     with con:
         con.execute("UPDATE items SET deep_analysis=? WHERE id=?", (text, item_id))
     con.close()
+
+
+# --- feedback -------------------------------------------------------------
+# Relevance used to be tuned only by hand-editing a topic's keywords and exclusions.
+# A vote is the same signal with no config edit: it biases who gets the fetch and
+# inference budget, bans a domain that keeps losing, and gives the judge examples.
+
+def vote(item_id, value):
+    """value: 1 (useful), -1 (junk), 0 (clear). Keyed by canon_url, so the verdict
+    applies to the link forever, not just to the run that happened to surface it."""
+    value = max(-1, min(1, int(value)))
+    con = connect()
+    r = con.execute(
+        "SELECT canon_url, domain, topic_id, title FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+    if not r or not r["canon_url"]:
+        con.close()
+        return None
+    with con:
+        if value == 0:
+            con.execute("DELETE FROM feedback WHERE canon_url=?", (r["canon_url"],))
+        else:
+            con.execute(
+                "INSERT INTO feedback(canon_url,domain,topic_id,title,vote) VALUES(?,?,?,?,?)"
+                " ON CONFLICT(canon_url) DO UPDATE SET vote=excluded.vote,"
+                " created_at=datetime('now')",
+                (r["canon_url"], r["domain"], r["topic_id"], r["title"], value),
+            )
+    con.close()
+    return {"canon_url": r["canon_url"], "vote": value}
+
+
+def votes_by_url():
+    con = connect()
+    out = {r["canon_url"]: r["vote"] for r in con.execute("SELECT canon_url, vote FROM feedback")}
+    con.close()
+    return out
+
+
+def domain_votes(topic_id=None):
+    """Net vote per domain. Topic-specific votes count double for their own topic: a
+    domain can be right for the job hunt and wrong for devlogs."""
+    con = connect()
+    rows = con.execute("SELECT domain, topic_id, SUM(vote) AS net FROM feedback"
+                       " WHERE domain IS NOT NULL AND domain != ''"
+                       " GROUP BY domain, topic_id").fetchall()
+    con.close()
+    net = {}
+    for r in rows:
+        w = 2 if (topic_id is not None and r["topic_id"] == topic_id) else 1
+        net[r["domain"]] = net.get(r["domain"], 0) + w * (r["net"] or 0)
+    return net
+
+
+def feedback_examples(topic_id=None, n=5):
+    """(liked, disliked) titles, most recent first - few-shot material for the judge."""
+    con = connect()
+    args, where = [], "1=1"
+    if topic_id is not None:
+        where = "(topic_id=? OR topic_id IS NULL)"
+        args = [topic_id]
+
+    def grab(sign):
+        return [r["title"] for r in con.execute(
+            "SELECT title FROM feedback WHERE " + where + " AND vote=? AND title IS NOT NULL"
+            " ORDER BY created_at DESC LIMIT ?", args + [sign, n])]
+
+    out = (grab(1), grab(-1))
+    con.close()
+    return out
+
+
+# --- page cache -----------------------------------------------------------
+
+def cached_pages(canon_urls, days):
+    """Extracted text from a previous run, still fresh enough to reuse."""
+    if not days or days <= 0 or not canon_urls:
+        return {}
+    urls = [u for u in canon_urls if u]
+    con = connect()
+    out = {}
+    # SQLite caps variables per statement; chunk rather than assume the batch is small.
+    for i in range(0, len(urls), 400):
+        chunk = urls[i:i + 400]
+        q = ("SELECT canon_url, content, published_at, author FROM page_cache"
+             " WHERE fetched_at >= datetime('now', ?) AND canon_url IN ("
+             + ",".join("?" * len(chunk)) + ")")
+        for r in con.execute(q, ["-" + str(int(days)) + " days"] + chunk):
+            out[r["canon_url"]] = dict(r)
+    con.close()
+    return out
+
+
+def cache_pages(items):
+    """Store what the fetch actually produced. Empty extractions are stored too: a page
+    that yields nothing today will yield nothing tomorrow, and skipping it is the point."""
+    rows = [(it.get("canon_url"), it.get("content") or "", it.get("published_at"),
+             it.get("author")) for it in items if it.get("canon_url")]
+    if not rows:
+        return 0
+    con = connect()
+    with con:
+        con.executemany(
+            "INSERT INTO page_cache(canon_url,content,published_at,author) VALUES(?,?,?,?)"
+            " ON CONFLICT(canon_url) DO UPDATE SET content=excluded.content,"
+            " published_at=excluded.published_at, author=excluded.author,"
+            " fetched_at=datetime('now')", rows)
+    con.close()
+    return len(rows)
+
+
+# --- full-text search -----------------------------------------------------
+
+def fts_query(text):
+    """Turn typed words into an FTS5 MATCH expression.
+
+    Raw user input is not valid FTS5 syntax: "c++" and a stray quote both raise
+    OperationalError. Quoting every token makes each one a literal phrase, and joining
+    with AND keeps multi-word searches narrowing rather than widening.
+    """
+    toks = [t.replace('"', "") for t in str(text or "").split()]
+    toks = [t for t in toks if t]
+    if not toks:
+        return ""
+    # Trailing * on the last token = prefix search, so "godo" finds "godot" while typing.
+    body = ['"' + t + '"' for t in toks[:-1]] + ['"' + toks[-1] + '"*']
+    return " AND ".join(body)

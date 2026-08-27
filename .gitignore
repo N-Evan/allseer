@@ -183,3 +183,6 @@ allseer.db
 
 # Serena MCP tool config
 .serena/
+
+# per-run markdown digests
+digests/

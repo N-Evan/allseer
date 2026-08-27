@@ -21,6 +21,12 @@ python run.py
 
 Open http://127.0.0.1:8077, press **Run Research Now**.
 
+```powershell
+python run.py --reload   # restart the server on every code edit
+python run.py --once     # one headless run, for Task Scheduler
+python run.py --port 9000
+```
+
 That's it. SearXNG is optional (see below) - the keyless providers work without it.
 
 ## What it searches
@@ -132,6 +138,82 @@ term in practice. Round-robin on domain alone then handed it to SearXNG, which r
 
 Ranking still happens afterwards on the real scores; this only decides who gets looked at.
 
+## Teaching it what you like
+
+Every card has a thumb up and a thumb down. That vote is the only part of the system that
+knows what *you* consider a good find, and it does three things on the next run:
+
+| Vote | Effect |
+|---|---|
+| up | that domain scores higher in the pre-LLM triage, so it is likelier to get a fetch and an inference slot |
+| down | the same, downward - and the title becomes a negative example in the judge's prompt |
+| net `-3` on a domain | the domain is dropped outright, before the fetch, in every future run |
+
+A vote is keyed by **canonical URL, not by run**, so it sticks to the link, and voting on
+the same story found again next week overwrites rather than double-counts. Voting `0`
+clears it.
+
+The bias is `tanh(net / 3)`, added to the prefilter as a signed `+/-0.15` term against a
+roughly 0-1 base. It saturates on purpose: three downvotes should already mean "stop
+showing me this", but the thirtieth must not outweigh recency, relevance and coverage
+combined.
+
+Votes on a topic count double for that topic and single elsewhere - a domain can be right
+for the job hunt and wrong for devlogs. The ban threshold is the `dislike_drop` setting;
+`0` turns banning off and keeps only the soft bias.
+
+The judge prompt gets your five most recent likes and dislikes as titles, labelled
+`Rated USEFUL` / `Rated JUNK`. This is the one part of the prompt that is not generic
+advice, and it is where a bigger `analysis_model` pays off - a 14B model calibrates
+against examples noticeably better than an 8B one.
+
+`GET /api/feedback` shows the current per-domain standing, so you can see what your
+voting has actually taught it.
+
+## Searching every run
+
+The search box queries an SQLite **FTS5** index over `title`, `snippet`, `llm_summary`,
+`llm_tags` and `domain`, across your whole history - not just the run on screen. Results
+come back newest-run-first. Opening a specific run or day from History scopes the search
+back to it.
+
+The last word is a prefix, so `geometr` finds "geometry" while you type, and extra words
+narrow rather than widen. Typed text is never valid FTS5 syntax on its own (`c++` and a
+stray quote both raise), so `db.fts_query()` quotes every token into a literal phrase
+before it reaches `MATCH`.
+
+The index is external-content: the rows live in `items` and two triggers keep the index in
+step. An older database is backfilled at startup - which is checked by comparing
+`items_fts_docsize` to `items`, **not** by selecting from `items_fts`, because an
+external-content table reads its column values from `items` and so reports every row even
+when the index is empty and no `MATCH` can find a thing.
+
+## The digest
+
+Every finished run writes `digests/YYYY-MM-DD-run<id>.md`: the promoted items only, grouped
+by topic and bucket, with the summary and the AI interpretation. A run that finishes into a
+browser tab is a run you have to remember to open; the same content on disk is readable on
+a phone, greppable from a shell, and outlives the database. Set `digest_dir` blank to turn
+it off.
+
+## What it does not download twice
+
+`max_fetch` is 40 pages a topic and at most 8 items are ever promoted, so most of every
+fetch budget was going on pages an earlier run had already read. Extracted text is now kept
+in `page_cache` and reused for `page_cache_days` (14). Failed extractions are cached too -
+a page that yields nothing today will yield nothing tomorrow, and skipping it is the point.
+Set `page_cache_days` to `0` to always refetch.
+
+This is not the same as `suppress_seen_days`, which hides links already *promoted*. The
+cache helps the much larger set that was fetched and never shortlisted.
+
+## Where the time went
+
+A run takes 5-15 minutes and the log never said which stage owned it. Each run's `stats`
+now carries `secs` - `search`, `fetch`, `judge`, `analyse` - shown as a badge on the run in
+History, along with how many pages came from the cache. Check it before changing a setting:
+a slow model and a slow network want opposite fixes.
+
 ## How the ranking works
 
 Deterministic signals are computed in Python; only judgement calls come from the LLM.
@@ -177,14 +259,18 @@ Every card separates them on purpose:
 | `suppress_seen_days` | skip links already promoted to a bucket in a run this recent (`21`); `0` = off |
 | `providers` | comma separated provider names |
 | `rss_feeds` | feed URLs for the `rss` provider, space or comma separated |
+| `page_cache_days` | reuse page text fetched this recently instead of downloading it again; `0` = always refetch |
+| `dislike_drop` | net downvotes that ban a domain from every future run (`3`); `0` = soft bias only |
+| `digest_dir` | folder for the per-run markdown digest (`digests`); blank = off |
 
 A run with `max_llm=35` on an 8B model takes roughly 5-15 minutes. Start smaller.
 
 ### Why a run can be perfect on disk and broken in the browser
 
-`uvicorn.run()` has no `--reload`. A dashboard started before an edit keeps serving the
-modules it imported at startup, silently, forever. A run made this way looked like a
-retrieval failure and was not:
+Start it with `python run.py --reload` while editing and this cannot happen.
+
+Without that flag the dashboard keeps serving the modules it imported at startup,
+silently, forever, and a run made that way looks like a retrieval failure when it is not:
 
 - `rss` was in the `providers` setting but not in the old `REGISTRY`, so `REGISTRY.get()`
   returned `None` and the provider was **skipped with no error** - zero feed results.
@@ -193,7 +279,7 @@ retrieval failure and was not:
 
 Tell them apart in one glance: the run's `stats` should contain `dropped_stale`,
 `dropped_seen`, `dropped_offtopic` and `dropped_excluded`. If those keys are missing, the
-server is older than the code on disk. **Restart it after every edit.**
+server is older than the code on disk - restart it, or use `--reload`.
 
 ### Why old items used to show up
 
@@ -212,8 +298,8 @@ moved on.
 ## Files
 
 ```
-run.py                  launcher (python run.py, or --once for a headless run)
-allseer/db.py           SQLite schema + settings
+run.py                  launcher (--reload while editing, --once for a headless run)
+allseer/db.py           SQLite schema, settings, votes, page cache, FTS helpers
 allseer/providers.py    search providers (add one here)
 allseer/extract.py      page fetch + text extraction
 allseer/dedupe.py       URL identity + same-story clustering
@@ -222,9 +308,14 @@ allseer/rank.py         scoring formulas + list selection
 allseer/pipeline.py     the run, start to finish
 allseer/app.py          FastAPI API + dashboard host
 static/index.html       the whole dashboard (no build step)
-tests/test_core.py      python tests/test_core.py
+tests/test_core.py      python tests/test_core.py - no network, no LLM, ~1.5s
 allseer.db              created on first run
+digests/                one markdown file per run
 ```
+
+Tables in `allseer.db`: `topics`, `runs`, `items`, `settings`, `feedback` (your votes,
+keyed by canonical URL), `page_cache` (extracted text, reused across runs), and
+`items_fts` (the search index over `items`).
 
 ## Scheduling (optional)
 

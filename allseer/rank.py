@@ -191,7 +191,27 @@ def diversify(items, key, n):
     return out
 
 
-def prefilter_score(item, topic):
+def vote_bias(item, domain_net=None):
+    """Your votes on a domain, squashed to -1..+1.
+
+    tanh, not a raw count: three downvotes should already say "stop showing me this",
+    while the thirtieth must not outweigh every other signal combined. Net 3 lands at
+    ~0.76, net 10 at ~0.995 - it saturates instead of taking over the formula.
+    """
+    if not domain_net:
+        return 0.0
+    return math.tanh(domain_net.get(item.get("domain") or "", 0) / 3.0)
+
+
+def banned(item, domain_net, threshold):
+    """A domain you have downvoted this many times, net. Deleting a bad source used to
+    mean hand-editing a topic's exclusions; downvoting it three times does the same."""
+    if not threshold or threshold <= 0 or not domain_net:
+        return False
+    return domain_net.get(item.get("domain") or "", 0) <= -abs(threshold)
+
+
+def prefilter_score(item, topic, domain_net=None):
     """Cheap pre-LLM triage: who gets the limited inference budget."""
     has_text = 1.0 if item.get("content_chars", 0) > 500 else 0.0
     return (
@@ -202,6 +222,10 @@ def prefilter_score(item, topic):
         # Was 0.20. Only GitHub populates this, so a high weight is a GitHub subsidy.
         + 0.10 * discussion_score(item)
         + 0.05 * has_text
+        # Signed, and outside the weights that sum to 1.0 on purpose: a domain you keep
+        # upvoting should be able to outrank a fresher item, and one you keep downvoting
+        # should lose to anything. Range -0.15..+0.15 against a ~0.0-1.0 base.
+        + 0.15 * vote_bias(item, domain_net)
     )
 
 

@@ -4,8 +4,11 @@ One run handles every selected topic in sequence. Any single step failing degrad
 run (fewer/weaker results) instead of killing it.
 """
 import asyncio
+import contextlib
 import json
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -37,6 +40,21 @@ def phase(name):
     log("== " + name)
 
 
+@contextlib.contextmanager
+def timed(stats, key):
+    """Accumulate wall-clock seconds per stage across every topic in the run.
+
+    A run takes 5-15 minutes and the log never said whether that went on searching,
+    fetching or inference - so there was no way to know which knob was the slow one.
+    """
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        secs = stats.setdefault("secs", {})
+        secs[key] = round(secs.get(key, 0.0) + time.monotonic() - t0, 1)
+
+
 def _cfg(settings, topic=None):
     # A topic may pin its own feed list. Job boards must not answer gamedev queries and
     # gamedev feeds must not answer job queries, and rss_feeds is a single global setting.
@@ -46,6 +64,7 @@ def _cfg(settings, topic=None):
         "searxng_url": settings.get("searxng_url", ""),
         "rss_feeds": feeds,
         "github_min_stars": db.setting_int(settings, "github_min_stars", 5),
+        "page_cache_days": db.setting_int(settings, "page_cache_days", 14),
     }
 
 
@@ -89,6 +108,7 @@ async def run_research(topic_ids=None, ad_hoc=None):
     drop_undated = db.setting_int(settings, "drop_undated", 0) == 1
     seen_days = db.setting_int(settings, "suppress_seen_days", 21)
     seen = db.seen_canon_urls(seen_days)
+    dislike_drop = db.setting_int(settings, "dislike_drop", 3)
     if seen:
         log("suppressing " + str(len(seen)) + " links already ranked in the last "
             + str(seen_days) + " days")
@@ -104,7 +124,9 @@ async def run_research(topic_ids=None, ad_hoc=None):
         "topics": len(all_topics), "queries": 0, "raw_results": 0, "unique_stories": 0,
         "fetched": 0, "judged": 0, "trending": 0, "niche": 0,
         "dropped_stale": 0, "dropped_seen": 0,
-        "dropped_offtopic": 0, "dropped_excluded": 0,
+        "dropped_offtopic": 0, "dropped_excluded": 0, "dropped_disliked": 0,
+        "cached_pages": 0,
+        "secs": {},
         "provider_errors": [], "llm_errors": [],
     }
     headers = {"User-Agent": settings.get("user_agent") or "allseer/0.1", "Accept-Language": "en"}
@@ -124,6 +146,12 @@ async def run_research(topic_ids=None, ad_hoc=None):
             for topic in all_topics:
                 STATUS["topic"] = topic["name"]
                 cfg = _cfg(settings, topic)
+                # Your votes, weighted towards this topic: the same domain can be right
+                # for the job hunt and wrong for devlogs.
+                domain_net = db.domain_votes(topic.get("id"))
+                examples = db.feedback_examples(topic.get("id"))
+                if domain_net:
+                    log("vote signal on " + str(len(domain_net)) + " domains")
 
                 phase("queries for: " + topic["name"])
                 if topic.get("feeds"):
@@ -156,9 +184,10 @@ async def run_research(topic_ids=None, ad_hoc=None):
                 phase("searching: " + topic["name"])
                 names = [p.strip() for p in (topic.get("providers") or "").split(",")
                          if p.strip()] or provider_names
-                results, errs = await providers.search_all(
-                    client, queries, cfg, names, on_event=log
-                )
+                with timed(stats, "search"):
+                    results, errs = await providers.search_all(
+                        client, queries, cfg, names, on_event=log
+                    )
                 stats["provider_errors"].extend(errs[:10])
                 stats["raw_results"] += len(results)
 
@@ -191,6 +220,14 @@ async def run_research(topic_ids=None, ad_hoc=None):
                         + " matching this topic's exclusions")
 
                 n_before = len(results)
+                results = [r for r in results
+                           if not rank.banned(r, domain_net, dislike_drop)]
+                stats["dropped_disliked"] += n_before - len(results)
+                if n_before - len(results):
+                    log("dropped " + str(n_before - len(results))
+                        + " from domains you have downvoted")
+
+                n_before = len(results)
                 results = [r for r in results if rank.on_topic(r, topic)]
                 stats["dropped_offtopic"] += n_before - len(results)
                 if n_before - len(results):
@@ -213,8 +250,12 @@ async def run_research(topic_ids=None, ad_hoc=None):
 
                 phase("fetching content: " + topic["name"])
                 to_fetch = rank.diversify(
-                    reps, lambda i: rank.prefilter_score(i, topic), max_fetch)
-                await extract.fetch_many(client, to_fetch, on_event=log)
+                    reps, lambda i: rank.prefilter_score(i, topic, domain_net), max_fetch)
+                with timed(stats, "fetch"):
+                    await extract.fetch_many(client, to_fetch, on_event=log,
+                                             cache_days=cfg["page_cache_days"])
+                stats["cached_pages"] += sum(
+                    1 for i in to_fetch if i.get("fetch_note") == "cached")
                 got = sum(1 for i in to_fetch if i.get("content_chars", 0) > 400)
                 stats["fetched"] += got
                 log("extracted readable text from " + str(got) + "/" + str(len(to_fetch)))
@@ -237,14 +278,15 @@ async def run_research(topic_ids=None, ad_hoc=None):
                 tried = {id(i) for i in to_fetch}
                 pool = [r for r in reps if id(r) in tried] or reps
                 shortlist = rank.diversify(
-                    pool, lambda i: rank.prefilter_score(i, topic), max_llm)
+                    pool, lambda i: rank.prefilter_score(i, topic, domain_net), max_llm)
                 log("judging " + str(len(shortlist)) + " items from "
                     + str(len({i.get("domain") for i in shortlist})) + " domains")
                 for n, it in enumerate(shortlist, 1):
                     log("judging " + str(n) + "/" + str(len(shortlist)) + ": "
                         + (it.get("title") or "")[:70])
                     try:
-                        it.update(await llm_mod.judge(analyst, it, topic))
+                        with timed(stats, "judge"):
+                            it.update(await llm_mod.judge(analyst, it, topic, examples))
                         stats["judged"] += 1
                     except Exception as e:
                         msg = "judge failed: " + type(e).__name__ + ": " + str(e)[:120]
@@ -274,13 +316,21 @@ async def run_research(topic_ids=None, ad_hoc=None):
                     if not iid:
                         continue
                     try:
-                        db.set_deep_analysis(iid, await llm_mod.deep_analyze(analyst, it, topic))
+                        with timed(stats, "analyse"):
+                            note = await llm_mod.deep_analyze(analyst, it, topic)
+                        db.set_deep_analysis(iid, note)
                         log("analysed: " + (it.get("title") or "")[:60])
                     except Exception as e:
                         log("deep analysis failed: " + type(e).__name__ + ": " + str(e)[:120])
 
         STATUS["stats"] = stats
         db.finish_run(run_id, "done", stats)
+        try:
+            path = write_digest(run_id, day, settings.get("digest_dir", ""))
+            if path:
+                log("digest written: " + str(path))
+        except OSError as e:
+            log("digest not written: " + type(e).__name__ + ": " + str(e)[:120])
         phase("done")
         log("run " + str(run_id) + " complete: " + json.dumps(
             {k: v for k, v in stats.items() if not k.endswith("errors")}))
@@ -300,6 +350,59 @@ async def run_research(topic_ids=None, ad_hoc=None):
     finally:
         STATUS["running"] = False
         STATUS["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_digest(run_id, day, out_dir):
+    """One markdown file per run, next to the database.
+
+    A run finishes and then sits in a browser tab you have to remember to open. The
+    same content on disk is readable on a phone, greppable from a shell, and survives
+    the database. Returns the path, or None if digests are off or the run was empty.
+    """
+    if not out_dir:
+        return None
+    con = db.connect()
+    rows = con.execute(
+        "SELECT topic_name, bucket, rank, title, url, domain, published_at,"
+        "       llm_summary, llm_why, snippet"
+        " FROM items WHERE run_id=? AND bucket!=''"
+        " ORDER BY topic_name,"
+        "   CASE bucket WHEN 'trending' THEN 0 ELSE 1 END, rank", (run_id,)).fetchall()
+    con.close()
+    if not rows:
+        return None
+
+    lines = ["# allseer " + str(day), "", "Run #" + str(run_id) + " - "
+             + str(len(rows)) + " picks", ""]
+    topic = bucket = None
+    for r in rows:
+        if r["topic_name"] != topic:
+            topic = r["topic_name"]
+            bucket = None
+            lines += ["", "## " + str(topic or "ad-hoc"), ""]
+        if r["bucket"] != bucket:
+            bucket = r["bucket"]
+            lines += ["### " + ("Top stories" if bucket == "trending" else "Niche finds"), ""]
+        lines.append(str(r["rank"]) + ". [" + str(r["title"] or "untitled").replace("]", ")")
+                     + "](" + str(r["url"] or "") + ")")
+        meta = str(r["domain"] or "")
+        if r["published_at"]:
+            meta += " - " + str(r["published_at"])[:10]
+        lines.append("   *" + meta + "*")
+        body = r["llm_summary"] or (r["snippet"] or "")[:300]
+        if body:
+            lines.append("   " + " ".join(str(body).split()))
+        if r["llm_why"]:
+            lines.append("   > **Why it matters (AI):** " + " ".join(str(r["llm_why"]).split()))
+        lines.append("")
+
+    d = Path(out_dir)
+    if not d.is_absolute():
+        d = db.DB_PATH.parent / d
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / (str(day) + "-run" + str(run_id) + ".md")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 _TASK = None

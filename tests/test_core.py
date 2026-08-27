@@ -3,16 +3,20 @@ clustering, the two scoring formulas, selection, and tolerant JSON parsing.
 
     python tests/test_core.py
 """
+import asyncio
 import collections
+import contextlib
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from allseer import db, pipeline, providers, rank
+from allseer import db, extract, pipeline, providers, rank
 from allseer.dedupe import canon_url, cluster, jaccard, pick_representatives, title_tokens
-from allseer.llm import parse_json, fallback_queries
+from allseer.llm import _examples_block, parse_json, fallback_queries
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
 
@@ -307,6 +311,228 @@ def test_topic_feeds_and_providers_override_the_global_settings():
     assert pipeline._cfg(settings, {"feeds": "https://jobs/feed"})["rss_feeds"] \
         == "https://jobs/feed"
     assert pipeline._cfg(settings, {"feeds": ""})["rss_feeds"] == "https://global/feed"
+
+
+# --- feedback, page cache, full-text search, digest, timings ---------------
+# These need a database, so they get a throwaway one. db.DB_PATH is read inside
+# connect(), so pointing it at a temp file redirects every call in the module.
+
+@contextlib.contextmanager
+def temp_db():
+    d = tempfile.mkdtemp(prefix="allseer-test-")
+    original = db.DB_PATH
+    db.DB_PATH = Path(d) / "t.db"
+    try:
+        db.init()
+        yield Path(d)
+    finally:
+        db.DB_PATH = original
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def store(run_id, **kw):
+    """One item in the database, with the fields these tests care about."""
+    it = {"url": "https://x.com/p", "title": "t", "domain": "x.com", "topic_id": 1,
+          "topic_name": "T", "snippet": "", "bucket": "", "rank": None}
+    it.update(kw)
+    it["canon_url"] = it.get("canon_url") or canon_url(it["url"])
+    return db.insert_items(run_id, [it])[0][0]
+
+
+def test_vote_bias_saturates_instead_of_taking_over():
+    """One downvote is a nudge; ten must not outweigh every other signal combined."""
+    item = {"domain": "spam.io"}
+    assert rank.vote_bias(item, None) == 0.0
+    assert rank.vote_bias(item, {}) == 0.0
+    assert rank.vote_bias({"domain": "other.io"}, {"spam.io": -9}) == 0.0
+    up1 = rank.vote_bias(item, {"spam.io": 1})
+    up3 = rank.vote_bias(item, {"spam.io": 3})
+    up30 = rank.vote_bias(item, {"spam.io": 30})
+    assert 0 < up1 < up3 < up30 < 1.0, (up1, up3, up30)
+    assert up30 - up3 < up3 - up1, "must saturate, not keep growing linearly"
+    assert rank.vote_bias(item, {"spam.io": -3}) == -up3          # symmetric
+
+    # and it has to actually move the triage order it feeds
+    topic = {"name": "godot renderer", "keywords": "godot, renderer"}
+    it = {"title": "godot renderer notes", "domain": "spam.io", "snippet": "", "url": ""}
+    plain = rank.prefilter_score(it, topic)
+    assert rank.prefilter_score(it, topic, {"spam.io": -30}) < plain
+    assert rank.prefilter_score(it, topic, {"spam.io": 30}) > plain
+
+
+def test_downvoting_a_domain_three_times_bans_it():
+    net = {"junk.io": -3, "meh.io": -2, "good.io": 5}
+    assert rank.banned({"domain": "junk.io"}, net, 3)
+    assert not rank.banned({"domain": "meh.io"}, net, 3)
+    assert not rank.banned({"domain": "good.io"}, net, 3)
+    assert not rank.banned({"domain": "junk.io"}, net, 0), "0 means never ban"
+    assert not rank.banned({"domain": "junk.io"}, {}, 3)
+
+
+def test_a_vote_is_keyed_to_the_link_not_the_run():
+    with temp_db():
+        r1, r2 = db.start_run("2026-08-28"), db.start_run("2026-08-29")
+        a = store(r1, url="https://blog.io/a", domain="blog.io", title="Renderer notes")
+        b = store(r2, url="https://blog.io/a", domain="blog.io", title="Renderer notes")
+        assert a != b, "the same link found again by a later run is a new row"
+
+        db.vote(a, 1)
+        assert db.votes_by_url()[canon_url("https://blog.io/a")] == 1
+        db.vote(b, -1)
+        assert db.domain_votes()["blog.io"] == -1, "one vote per link, not per row"
+        db.vote(b, 0)
+        assert db.domain_votes() == {}, "0 clears the vote"
+        assert db.vote(10 ** 6, 1) is None, "unknown item is not a crash"
+
+
+def test_votes_count_double_for_their_own_topic():
+    with temp_db():
+        r = db.start_run("2026-08-28")
+        db.vote(store(r, url="https://a.io/1", domain="a.io", topic_id=1), -1)
+        db.vote(store(r, url="https://a.io/2", domain="a.io", topic_id=2), -1)
+        assert db.domain_votes()["a.io"] == -2       # no topic given: plain sum
+        assert db.domain_votes(1)["a.io"] == -3      # own topic weighs double
+        assert db.domain_votes(2)["a.io"] == -3
+
+
+def test_the_judge_is_shown_your_recent_verdicts():
+    with temp_db():
+        r = db.start_run("2026-08-28")
+        db.vote(store(r, url="https://a.io/1", title="Godot renderer deep dive"), 1)
+        db.vote(store(r, url="https://b.io/2", title="Top 10 engines 2026"), -1)
+        liked, disliked = db.feedback_examples(1)
+        assert liked == ["Godot renderer deep dive"], liked
+        assert disliked == ["Top 10 engines 2026"], disliked
+
+    assert _examples_block(None) == ""
+    assert _examples_block(([], [])) == "", "no votes yet = no prompt bloat"
+    block = _examples_block((["good one"], ["bad one"]))
+    assert "good one" in block and "bad one" in block
+    assert "USEFUL" in block and "JUNK" in block
+
+
+def test_search_reaches_every_run_not_just_the_latest():
+    with temp_db():
+        old_run, new_run = db.start_run("2026-08-01"), db.start_run("2026-08-28")
+        store(old_run, url="https://a.io/1", domain="a.io", bucket="trending", rank=1,
+              title="Nanite virtualized geometry teardown")
+        store(new_run, url="https://b.io/2", domain="b.io", bucket="trending", rank=1,
+              title="Bevy ECS scheduling rewrite")
+        con = db.connect()
+
+        def hits(text):
+            return [r[0] for r in con.execute(
+                "SELECT title FROM items WHERE id IN"
+                " (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)",
+                (db.fts_query(text),))]
+
+        assert hits("nanite") == ["Nanite virtualized geometry teardown"]
+        assert hits("bevy ecs") == ["Bevy ECS scheduling rewrite"]
+        assert hits("geometr") == ["Nanite virtualized geometry teardown"], "prefix search"
+        assert hits("nanite bevy") == [], "extra words narrow, they do not widen"
+        assert hits("a.io") == ["Nanite virtualized geometry teardown"], "domain is indexed"
+        # typed text is not FTS5 syntax; none of this may raise
+        for hostile in ["c++", "!!!", "NEAR(", "a AND", '" OR 1=1 --', "-"]:
+            con.execute("SELECT rowid FROM items_fts WHERE items_fts MATCH ?",
+                        (db.fts_query(hostile) or '"zz"',)).fetchall()
+        con.close()
+    assert db.fts_query("   ") == "", "a blank search must not become match-all"
+
+
+def test_the_index_backfills_for_a_database_that_predates_it():
+    with temp_db():
+        r = db.start_run("2026-08-28")
+        store(r, url="https://a.io/1", title="Nanite geometry teardown")
+        con = db.connect()
+        with con:
+            con.execute("DROP TABLE items_fts")     # a database from before the index
+        con.close()
+        db.init()
+        con = db.connect()
+        n = con.execute("SELECT count(*) FROM items_fts WHERE items_fts MATCH ?",
+                        (db.fts_query("nanite"),)).fetchone()[0]
+        con.close()
+        assert n == 1, "existing rows must be indexed on startup, not only new ones"
+
+
+def test_a_cached_page_is_not_downloaded_twice():
+    with temp_db():
+        assert db.cache_pages([{"canon_url": "https://a.io/p", "content": "body text",
+                                "published_at": "2026-08-27", "author": "Ada"}]) == 1
+        got = db.cached_pages(["https://a.io/p", "https://b.io/q"], 14)
+        assert set(got) == {"https://a.io/p"}
+        assert got["https://a.io/p"]["content"] == "body text"
+        assert db.cached_pages(["https://a.io/p"], 0) == {}, "0 days = cache off"
+
+        con = db.connect()
+        with con:
+            con.execute("UPDATE page_cache SET fetched_at=datetime('now','-30 days')")
+        con.close()
+        assert db.cached_pages(["https://a.io/p"], 14) == {}, "stale entries expire"
+
+        # and the fetcher has to actually skip what it already has
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/html"}
+            text = "<html></html>"
+
+        class FakeClient:
+            async def get(self, url, **kw):
+                calls.append(url)
+                return FakeResponse()
+
+        db.cache_pages([{"canon_url": "https://a.io/p", "content": "cached body",
+                         "published_at": None, "author": None}])
+        items = [{"url": "https://a.io/p", "canon_url": "https://a.io/p", "domain": "a.io"},
+                 {"url": "https://c.io/r", "canon_url": "https://c.io/r", "domain": "c.io"}]
+        out = asyncio.run(extract.fetch_many(FakeClient(), items, cache_days=14))
+        assert calls == ["https://c.io/r"], calls
+        assert len(out) == 2, "every item comes back, cached or freshly fetched"
+        assert items[0]["content"] == "cached body"
+        assert items[0]["fetch_note"] == "cached"
+
+
+def test_the_digest_lists_every_promoted_item_and_nothing_else():
+    with temp_db() as root:
+        r = db.start_run("2026-08-28")
+        store(r, url="https://a.io/1", domain="a.io", title="Bevy ECS rewrite",
+              bucket="trending", rank=1, llm_summary="They rewrote the scheduler.",
+              llm_why="Signals a stable 1.0.")
+        store(r, url="https://b.io/2", domain="b.io", title="A one-person shader blog",
+              bucket="niche", rank=1)
+        store(r, url="https://c.io/3", domain="c.io", title="Not shortlisted")
+
+        assert pipeline.write_digest(r, "2026-08-28", "") is None, "blank dir = off"
+        path = pipeline.write_digest(r, "2026-08-28", str(root / "digests"))
+        text = path.read_text(encoding="utf-8")
+        assert path.name == "2026-08-28-run" + str(r) + ".md"
+        assert "Bevy ECS rewrite" in text and "https://a.io/1" in text
+        assert "A one-person shader blog" in text
+        assert "Not shortlisted" not in text, "only promoted items go in the digest"
+        assert "Top stories" in text and "Niche finds" in text
+        assert "They rewrote the scheduler." in text and "Signals a stable 1.0." in text
+        assert pipeline.write_digest(db.start_run("2026-08-29"), "2026-08-29",
+                                     str(root / "digests")) is None, "empty run, no file"
+
+
+def test_stage_timings_accumulate_across_topics():
+    stats = {}
+    for _ in range(2):
+        with pipeline.timed(stats, "judge"):
+            pass
+    with pipeline.timed(stats, "fetch"):
+        pass
+    assert set(stats["secs"]) == {"judge", "fetch"}
+    assert all(v >= 0 for v in stats["secs"].values())
+    # a stage that raises still records its time instead of losing the run's stats
+    try:
+        with pipeline.timed(stats, "search"):
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert "search" in stats["secs"]
 
 
 if __name__ == "__main__":
