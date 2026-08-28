@@ -221,6 +221,84 @@ def feedback_summary(topic_id: int | None = None):
     }
 
 
+@app.get("/api/angles")
+def angles():
+    """The post writer's fixed vocabulary. Served so the UI never restates it."""
+    return {
+        "angles": [
+            {"key": k, "name": v["name"], "min_items": v["min_items"],
+             "needs_take": v["needs_take"], "blurb": v["blurb"]}
+            for k, v in llm_mod.ANGLES.items()
+        ],
+        "lengths": llm_mod.LENGTHS,
+    }
+
+
+@app.post("/api/posts")
+async def create_post(body: dict):
+    """{"item_ids": [...], "angle": "...", "length": "...", "hashtags_on": true,
+    "take": "..."} -> writes a LinkedIn draft from those items and stores it.
+
+    Awaited inline rather than run through pipeline.STATUS: it is one LLM call, and
+    keeping it off the pipeline means a post can be written during a research run."""
+    angle = str(body.get("angle") or "").strip()
+    a = llm_mod.ANGLES.get(angle)
+    if not a:
+        raise HTTPException(400, "unknown angle: " + (angle or "(none given)"))
+    length = str(body.get("length") or "medium")
+    if length not in llm_mod.LENGTHS:
+        raise HTTPException(400, "unknown length: " + length)
+    take = str(body.get("take") or "").strip()
+    if a["needs_take"] and not take:
+        raise HTTPException(400, "the '" + a["name"] + "' angle needs your own take - "
+                                 "the take is the post")
+    try:
+        ids = [int(i) for i in (body.get("item_ids") or [])]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "item_ids must be integers")
+    if len(ids) < a["min_items"]:
+        raise HTTPException(400, "the '" + a["name"] + "' angle needs at least "
+                            + str(a["min_items"]) + " selected item(s), got " + str(len(ids)))
+    items = db.items_by_ids(ids)
+    if len(items) != len(ids):
+        raise HTTPException(400, "one of the selected items no longer exists")
+    hashtags_on = bool(body.get("hashtags_on", True))
+    s = db.get_settings()
+    llm = llm_mod.Ollama(s["ollama_url"], s.get("analysis_model") or s["ollama_model"])
+    out = await llm_mod.write_post(llm, items, angle, length, hashtags_on, take, s)
+    warn = llm_mod.lint_post(out["hooks"][0] if out["hooks"] else "",
+                             out["body"], out["hashtags"], angle)
+    # Hooks 2 and 3 are one radio click away, so a cliche hiding in one of them has to
+    # surface as well - numbered, so it is obvious which hook not to pick.
+    for n, h in enumerate(out["hooks"][1:], 2):
+        warn += ["hook " + str(n) + ": " + w for w in llm_mod.lint_post(h, "", [], angle)]
+    out["warnings"] = warn
+    pid = db.insert_post({**out, "item_ids": ids,
+                          "titles": [i.get("title") for i in items],
+                          "angle": angle, "length": length,
+                          "hashtags_on": hashtags_on, "take": take})
+    return db.get_post(pid)
+
+
+@app.get("/api/posts")
+def posts(limit: int = 50):
+    return {"posts": db.list_posts(limit)}
+
+
+@app.put("/api/posts/{post_id}")
+def save_post(post_id: int, body: dict):
+    if not db.update_post(post_id, str(body.get("edited") or "")):
+        raise HTTPException(404, "no such post")
+    return {"ok": True}
+
+
+@app.delete("/api/posts/{post_id}")
+def remove_post(post_id: int):
+    if not db.delete_post(post_id):
+        raise HTTPException(404, "no such post")
+    return {"ok": True}
+
+
 @app.post("/api/settings")
 def settings(body: dict):
     db.save_settings(body or {})

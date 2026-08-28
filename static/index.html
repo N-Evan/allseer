@@ -82,6 +82,7 @@ label.f span{display:block;font-size:12px;color:var(--dim);margin-bottom:3px}
   <div class="logo">all<span>seer</span></div>
   <button class="tab on" data-view="today">Today</button>
   <button class="tab" data-view="history">History</button>
+  <button class="tab" data-view="write">Write</button>
   <button class="tab" data-view="settings">Settings</button>
   <div class="grow"></div>
   <div class="status" id="status"><i class="dot"></i><span>idle</span></div>
@@ -119,6 +120,51 @@ label.f span{display:block;font-size:12px;color:var(--dim);margin-bottom:3px}
   <section id="view-history" style="display:none">
     <h2>Past runs</h2>
     <div id="runs"></div>
+  </section>
+
+  <section id="view-write" style="display:none">
+    <div id="personaNag"></div>
+
+    <h2>1. What to write about<small>one item for a single-source post, two or more for a synthesis</small></h2>
+    <div class="card" style="cursor:default">
+      <div class="row">
+        <select id="wTopic" style="max-width:220px"><option value="">All topics</option></select>
+        <input id="wSearch" placeholder="Search all runs..." style="max-width:280px">
+        <select id="wBucket" style="max-width:180px">
+          <option value="">Ranked only</option>
+          <option value="trending">Trending only</option>
+          <option value="niche">Niche only</option>
+          <option value="all">Everything discovered</option>
+        </select>
+      </div>
+      <div id="wChips" class="row" style="margin-top:11px"></div>
+      <div id="wPick" style="max-height:300px;overflow:auto;margin-top:8px"></div>
+    </div>
+
+    <h2>2. The angle</h2>
+    <div class="card" style="cursor:default">
+      <div class="grid2">
+        <label class="f"><span>Angle</span><select id="wAngle"></select></label>
+        <label class="f"><span>Length</span><select id="wLength">
+          <option value="short">Short - about 70 words</option>
+          <option value="medium" selected>Medium - about 150 words</option>
+          <option value="long">Long - about 260 words</option></select></label>
+        <label class="f"><span>Hashtags</span><select id="wTags">
+          <option value="1">3-5 specific hashtags</option>
+          <option value="0">None</option></select></label>
+      </div>
+      <div class="hint" id="wAngleBlurb" style="margin:-4px 0 10px"></div>
+      <label class="f"><span id="wTakeLabel">Your take</span><input id="wTake"></label>
+      <div class="row">
+        <button class="primary" id="wGen">Write the post</button>
+        <span class="hint" id="wGenHint"></span>
+      </div>
+    </div>
+
+    <div id="wOut"></div>
+
+    <h2>Drafts</h2>
+    <div id="wDrafts"></div>
   </section>
 
   <section id="view-settings" style="display:none">
@@ -169,7 +215,13 @@ const SETTING_HELP = {
   drop_undated: '1 = discard items with no publish date at all (strict)',
   suppress_seen_days: 'Skip links already promoted in a run this recent (0 = off)',
   github_min_stars: 'Minimum stars for a newly created repo to be worth a slot (0 = off)',
-  user_agent: 'User-Agent used when fetching pages'
+  user_agent: 'User-Agent used when fetching pages',
+  persona_role: 'WRITER - your job title and the context you work in',
+  persona_expertise: 'WRITER - what you can credibly speak on',
+  persona_audience: 'WRITER - who the posts are aimed at',
+  persona_voice: 'WRITER - tone rules in your own words, e.g. dry, concrete, first person, no hype',
+  persona_sample: 'WRITER - a paragraph of your actual writing. The single best defence against generic output',
+  persona_avoid: 'WRITER - words and phrases you never use'
 };
 
 function when(iso){
@@ -250,12 +302,15 @@ async function loadResults(){
 
 async function loadState(){
   STATE = await api('/api/state');
-  const tf = $('#topicFilter'), cur = tf.value;
-  tf.innerHTML = '<option value="">All topics</option>' +
+  const opts = '<option value="">All topics</option>' +
     STATE.topics.map(t => `<option value="${t.id}">${esc(t.name)}${t.enabled?'':' (off)'}</option>`).join('');
-  tf.value = cur;
+  for (const sel of ['#topicFilter', '#wTopic']) {
+    const el = $(sel), cur = el.value;
+    el.innerHTML = opts;
+    el.value = cur;
+  }
   renderStatus(STATE.status);
-  renderTopics(); renderSettings(); renderRuns();
+  renderTopics(); renderSettings(); renderRuns(); renderPersonaNag();
 }
 
 function renderStatus(s){
@@ -292,9 +347,24 @@ function renderTopics(){
 }
 
 function renderSettings(){
-  $('#settingsForm').innerHTML = Object.entries(STATE.settings).map(([k,v]) =>
-    `<label class="f"><span>${k} - ${esc(SETTING_HELP[k]||'')}</span>
-      <input data-set="${k}" value="${esc(v)}"></label>`).join('');
+  // persona_* are paragraphs, not values: they get a full-width textarea. Everything
+  // else keeps the one-line input, so no new settings screen was needed for the writer.
+  $('#settingsForm').innerHTML = Object.entries(STATE.settings).map(([k,v]) => {
+    const p = k.startsWith('persona_');
+    return `<label class="f"${p?' style="grid-column:1/-1"':''}><span>${k} - ${esc(SETTING_HELP[k]||'')}</span>` +
+      (p ? `<textarea data-set="${k}" rows="${k==='persona_sample'?5:2}">${esc(v)}</textarea>`
+         : `<input data-set="${k}" value="${esc(v)}">`) + `</label>`;
+  }).join('');
+}
+
+function renderPersonaNag(){
+  const s = STATE.settings || {};
+  $('#personaNag').innerHTML = ((s.persona_role||'').trim() || (s.persona_voice||'').trim()) ? '' :
+    `<div class="card" style="cursor:default;border-color:var(--warn)">
+      <b>Set your author profile first.</b>
+      <div class="hint" style="margin-top:5px">With persona_role, persona_voice and persona_sample empty,
+      every post is written from the article alone - which is exactly what reads as generic.</div>
+      <button data-view="settings" style="margin-top:9px">Go to Settings</button></div>`;
 }
 
 // Which stage a 5-15 minute run actually spent its time in - otherwise there is no
@@ -328,6 +398,9 @@ async function openItem(id){
       <div class="grow"></div><span class="badge st">${esc(it.source_type)}</span>
       ${it.bucket?`<span class="badge rank ${it.bucket==='niche'?'n':''}">${it.bucket} #${it.rank}</span>`:''}
       ${voteButtons(it)}</div>
+    <div class="row" style="margin-top:12px">
+      <button data-write-about="${it.id}" data-write-title="${esc(it.title)}">Write a LinkedIn post about this</button>
+    </div>
     <h2 style="margin-top:16px">${esc(it.topic_name||'')}</h2>
     <h3 style="font-size:21px;margin:0 0 8px">${esc(it.title)}</h3>
     <div class="meta"><a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.domain)} &nearr;</a>
@@ -355,10 +428,159 @@ async function openItem(id){
   $('#closeSheet').onclick = () => $('#drawer').classList.remove('on');
 }
 
+// --- Write: turn a discovery into a LinkedIn draft -------------------------
+// SEL is id -> title so a chip survives the picker being re-filtered out from under it.
+let ANGLES = [], SEL = new Map(), WITEMS = [], DRAFT = null, DRAFTS = [];
+
+async function loadAngles(){
+  ANGLES = (await api('/api/angles')).angles;
+  renderAngleSelect();
+}
+
+const curAngle = () => ANGLES.find(a => a.key === $('#wAngle').value) || ANGLES[0];
+
+function renderAngleSelect(){
+  if (!ANGLES.length) return;
+  const cur = $('#wAngle').value;
+  $('#wAngle').innerHTML = ANGLES.map(a => {
+    const short = SEL.size < a.min_items;
+    return `<option value="${a.key}"${short?' disabled':''}${a.key===cur&&!short?' selected':''}>` +
+      `${esc(a.name)}${short?' - needs '+a.min_items+'+ items':''}</option>`;
+  }).join('');
+  if ($('#wAngle').selectedIndex < 0) $('#wAngle').selectedIndex = 0;
+  renderAngleHint();
+}
+
+function renderAngleHint(){
+  const a = curAngle(); if (!a) return;
+  $('#wAngleBlurb').textContent = a.blurb;
+  const need = a.needs_take, empty = !$('#wTake').value.trim();
+  $('#wTakeLabel').textContent = need
+    ? 'Your take - REQUIRED for this angle, it is the post'
+    : 'Your take - optional, one line in your own words';
+  $('#wTake').placeholder = need
+    ? 'What you actually did, saw or measured'
+    : 'e.g. this only matters if you run your own inference';
+  $('#wTake').style.borderColor = (need && empty) ? 'var(--warn)' : '';
+}
+
+async function loadPickList(){
+  const p = new URLSearchParams();
+  const t = $('#wTopic').value, q = $('#wSearch').value.trim(), b = $('#wBucket').value;
+  if (t) p.set('topic_id', t);
+  if (q) p.set('q', q);
+  if (b) p.set('bucket', b);
+  p.set('limit', '60');
+  WITEMS = (await api('/api/results?' + p)).items;
+  $('#wPick').innerHTML = WITEMS.map(i => `<label class="tr" style="cursor:pointer">
+    <input type="checkbox" data-pick="${i.id}" style="width:auto" ${SEL.has(String(i.id))?'checked':''}>
+    <span>${esc(i.title)}</span><div class="grow"></div>
+    <span class="badge">${esc(i.domain||'')}</span>
+    <span class="hint">${when(i.published_at)}</span></label>`).join('')
+    || '<div class="empty">Nothing matches. Widen the filter or run some research.</div>';
+  renderChips();
+}
+
+function renderChips(){
+  $('#wChips').innerHTML = SEL.size
+    ? [...SEL].map(([id,t]) => `<span class="badge">${esc(String(t).slice(0,54))}
+        <b data-unpick="${id}" style="cursor:pointer;color:var(--bad);margin-left:6px">&times;</b></span>`).join('')
+      + `<span class="hint">${SEL.size} selected</span>`
+    : '<span class="hint">Nothing selected yet.</span>';
+  renderAngleSelect();
+}
+
+function pick(id, on){
+  if (on) SEL.set(id, (WITEMS.find(i => String(i.id) === id) || {}).title || ('item ' + id));
+  else SEL.delete(id);
+  renderChips();
+}
+
+async function generatePost(){
+  const a = curAngle(); if (!a) return;
+  $('#wGen').disabled = true;
+  $('#wGenHint').textContent = 'writing with the local model, this takes 20-60s...';
+  try {
+    DRAFT = await api('/api/posts', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({item_ids: [...SEL.keys()].map(Number), angle: a.key,
+        length: $('#wLength').value, hashtags_on: $('#wTags').value === '1',
+        take: $('#wTake').value})});
+    renderDraft();
+    loadDrafts();
+    $('#wOut').scrollIntoView({behavior:'smooth', block:'start'});
+  } catch (err) { alert(err.message); }
+  $('#wGen').disabled = false;
+  $('#wGenHint').textContent = '';
+}
+
+// What actually goes on the clipboard: the hook you picked, the body as you edited it,
+// then the hashtags. Never the first comment - that is a separate paste.
+function composedPost(){
+  const hook = document.querySelector('input[name=whook]:checked');
+  const tags = (DRAFT.hashtags || []).map(t => '#' + t).join(' ');
+  return [hook ? hook.value : ((DRAFT.hooks||[])[0] || ''), '', $('#wBody').value.trim(), '', tags]
+    .join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function renderDraft(){
+  if (!DRAFT) { $('#wOut').innerHTML = ''; return; }
+  const hooks = DRAFT.hooks || [], warn = DRAFT.warnings || [];
+  $('#wOut').innerHTML = `<h2>3. The draft<small>${esc(DRAFT.angle)} &middot; ${esc(DRAFT.length||'')} &middot; ${esc(DRAFT.model||'')}</small></h2>
+  <div class="card" style="cursor:default">
+    ${warn.length ? `<div class="row" style="margin-bottom:12px">${warn.map(x =>
+      `<span class="badge" style="border-color:var(--warn);color:var(--warn)">${esc(x)}</span>`).join('')}</div>` : ''}
+    <h2 style="margin-top:0">Pick a hook</h2>
+    ${hooks.map((h,n) => `<label class="f" style="display:flex;gap:9px;align-items:flex-start;cursor:pointer">
+      <input type="radio" name="whook" value="${esc(h)}"${n===0?' checked':''} style="width:auto;margin-top:5px">
+      <span>${esc(h)} <span class="hint">(${h.length} chars)</span></span></label>`).join('')}
+    <h2>Body</h2>
+    <textarea id="wBody" rows="12">${esc(DRAFT.edited || DRAFT.body)}</textarea>
+    ${(DRAFT.hashtags||[]).length ? `<div class="hint" style="margin-top:8px">${
+      DRAFT.hashtags.map(t => '#' + esc(t)).join(' ')}</div>` : ''}
+    <h2>First comment<small>where the link goes - LinkedIn throttles posts with outbound links</small></h2>
+    <textarea id="wComment" rows="3">${esc(DRAFT.first_comment)}</textarea>
+    <div class="row" style="margin-top:13px">
+      <button class="primary" id="wCopy">Copy post</button>
+      <button id="wCopyC">Copy first comment</button>
+      <button id="wSave">Save edit</button>
+      <button id="wRegen">Regenerate</button>
+    </div>
+    <div class="hint" style="margin-top:10px">Written from: ${(DRAFT.titles||[]).map(esc).join(' &middot; ')}</div>
+  </div>`;
+}
+
+async function loadDrafts(){
+  DRAFTS = (await api('/api/posts?limit=30')).posts;
+  $('#wDrafts').innerHTML = DRAFTS.map(p => `<div class="tr">
+    <span class="badge">${esc(p.angle||'')}</span>
+    <span class="hint">${esc((p.created_at||'').replace('T',' '))}</span>
+    <span>${esc(((p.hooks||[])[0] || p.body || '').slice(0,80))}</span>
+    <div class="grow"></div>
+    ${p.edited ? '<span class="badge">edited</span>' : ''}
+    <button data-draft="${p.id}">Open</button>
+    <button data-draftdel="${p.id}">Delete</button></div>`).join('')
+    || '<div class="empty">No drafts yet.</div>';
+}
+
+async function copyText(s, btn){
+  try { await navigator.clipboard.writeText(s); }
+  catch {
+    // Clipboard API needs a secure context; a hidden textarea works everywhere else.
+    const ta = document.createElement('textarea');
+    ta.value = s; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  const old = btn.textContent;
+  btn.textContent = 'Copied';
+  setTimeout(() => btn.textContent = old, 1200);
+}
+
 function show(v){
   VIEW = v;
-  for (const n of ['today','history','settings']) $('#view-'+n).style.display = n===v ? '' : 'none';
+  for (const n of ['today','history','write','settings']) $('#view-'+n).style.display = n===v ? '' : 'none';
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.view===v));
+  // The Write view costs three requests; it pays for them the first time you open it.
+  if (v === 'write' && !ANGLES.length) loadAngles().then(loadPickList).then(loadDrafts);
 }
 
 document.addEventListener('click', async e => {
@@ -426,6 +648,43 @@ document.addEventListener('click', async e => {
     await api('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     t.textContent = 'Saved'; setTimeout(() => t.textContent = 'Save settings', 1200); loadState();
   }
+  if (t.dataset.unpick) { SEL.delete(t.dataset.unpick); renderChips(); loadPickList(); }
+  if (t.id === 'wGen' || t.id === 'wRegen') generatePost();
+  if (t.id === 'wCopy') copyText(composedPost(), t);
+  if (t.id === 'wCopyC') copyText($('#wComment').value, t);
+  if (t.id === 'wSave') {
+    try {
+      await api('/api/posts/' + DRAFT.id, {method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({edited: composedPost()})});
+      DRAFT.edited = composedPost();
+      t.textContent = 'Saved'; setTimeout(() => t.textContent = 'Save edit', 1200);
+      loadDrafts();
+    } catch (err) { alert(err.message); }
+  }
+  if (t.dataset.draft) {
+    DRAFT = DRAFTS.find(p => String(p.id) === t.dataset.draft);
+    if (DRAFT) {
+      SEL = new Map((DRAFT.item_ids||[]).map((id,n) => [String(id), (DRAFT.titles||[])[n] || ('item '+id)]));
+      renderChips(); renderDraft();
+      $('#wTake').value = DRAFT.take || '';
+      $('#wLength').value = DRAFT.length || 'medium';
+      $('#wTags').value = DRAFT.hashtags_on ? '1' : '0';
+      $('#wAngle').value = DRAFT.angle; renderAngleHint();
+      $('#wOut').scrollIntoView({behavior:'smooth', block:'start'});
+    }
+  }
+  if (t.dataset.draftdel && confirm('Delete this draft?')) {
+    await api('/api/posts/' + t.dataset.draftdel, {method:'DELETE'});
+    if (DRAFT && String(DRAFT.id) === t.dataset.draftdel) { DRAFT = null; renderDraft(); }
+    loadDrafts();
+  }
+  if (t.dataset.writeAbout) {
+    const id = t.dataset.writeAbout;
+    SEL = new Map([[id, t.dataset.writeTitle || ('item ' + id)]]);
+    $('#drawer').classList.remove('on');
+    show('write');
+    if (ANGLES.length) { renderChips(); loadPickList(); }
+  }
   if (t.id === 'checkHealth') {
     $('#healthOut').textContent = 'checking...';
     const h = await api('/api/health');
@@ -439,6 +698,14 @@ document.addEventListener('click', async e => {
 ['#topicFilter','#bucketFilter'].forEach(s => $(s).addEventListener('change', loadResults));
 $('#adhoc').addEventListener('keydown', e => { if (e.key === 'Enter') $('#adhocBtn').click(); });
 let deb; $('#search').addEventListener('input', () => { clearTimeout(deb); deb = setTimeout(loadResults, 300); });
+
+['#wTopic','#wBucket'].forEach(s => $(s).addEventListener('change', loadPickList));
+let wdeb; $('#wSearch').addEventListener('input', () => { clearTimeout(wdeb); wdeb = setTimeout(loadPickList, 300); });
+$('#wPick').addEventListener('change', e => {
+  if (e.target.dataset.pick) pick(e.target.dataset.pick, e.target.checked);
+});
+$('#wAngle').addEventListener('change', renderAngleHint);
+$('#wTake').addEventListener('input', renderAngleHint);
 
 let wasRunning = false;
 async function poll(){

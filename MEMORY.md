@@ -232,8 +232,39 @@ Eight topics x 5 queries x 5 providers is a long run. Run a subset by `topic_ids
 `queries_per_topic`, when iterating.
 
 
+## LinkedIn post writer - the Write tab (2026-08-28)
+
+A fourth view, bolted on beside the pipeline rather than into it. Pick 1+ discovered items,
+pick an angle, get 3 hooks + an editable body + first-comment text. Drafts live in `posts`.
+
+Settled decisions:
+
+- **Nine angles hardcoded in `llm.py`** (`ANGLES`), not a DB table. Tuning one is a
+  one-line edit; an angle CRUD screen would be more code than the angles.
+- **Persona lives in the `settings` key/value table** (`persona_*`), not its own table.
+  `renderSettings()` already renders every settings key, so six new keys cost zero UI.
+  It renders a `textarea` for `persona_*` and an `input` for everything else.
+- **Generation is awaited inline in the endpoint**, never `pipeline.STATUS`. One LLM call,
+  and keeping it off the pipeline means you can write a post during a research run.
+- **`temperature=0.8` for the post writer** (the judge stays at 0.2). At 0.2 the three
+  hooks came back as one hook reworded twice, which defeats offering a choice.
+- **Lint warns, never blocks or retries.** A human reads a bad post faster than a retry
+  loop rewrites one. Every hook is linted, not just the first - hooks 2 and 3 are one
+  radio click from being published.
+- The prompt says `WHO IS WRITING THIS POST`, not `AUTHOR`: every SOURCE block already has
+  an `AUTHOR:` field meaning the person who wrote the article.
+- Empty `persona_*` fields are omitted from the prompt entirely. Sending blanks teaches the
+  model that an empty author profile is normal and it writes to that.
+- `posts.titles` is denormalised so a draft stays readable after its source item is deleted.
+
+`persona_sample` (a paragraph of the owner's own writing) is the highest-leverage field in
+the app. With the persona empty the output is measurably generic - a first real run on
+`qwen2.5:14b` produced hooks ending in *"Check it out!"* and *"Intrigued?"*, which is what
+put those phrases in `BANNED`.
+
 ## Where things are
 
 `run.py` launcher | `allseer/db.py` schema+settings | `providers.py` search |
-`extract.py` fetch+text | `dedupe.py` URL identity+clustering | `llm.py` Ollama+3 prompts |
-`rank.py` formulas+selection | `pipeline.py` the run | `app.py` API | `static/index.html` UI
+`extract.py` fetch+text | `dedupe.py` URL identity+clustering |
+`llm.py` Ollama+4 prompts+post angles+lint | `rank.py` formulas+selection |
+`pipeline.py` the run | `app.py` API | `static/index.html` UI

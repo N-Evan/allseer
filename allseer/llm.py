@@ -1,4 +1,4 @@
-"""Ollama client + the three prompts the pipeline needs.
+"""Ollama client + the four prompts the pipeline needs.
 
 Swap in another local backend by reimplementing chat() with the same signature.
 """
@@ -18,7 +18,7 @@ class Ollama:
         self.model = model
         self.timeout = timeout
 
-    async def chat(self, system, user, as_json=True, num_predict=700):
+    async def chat(self, system, user, as_json=True, num_predict=700, temperature=0.2):
         payload = {
             "model": self.model,
             "stream": False,
@@ -26,7 +26,12 @@ class Ollama:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "options": {"temperature": 0.2, "num_predict": num_predict},
+            "options": {"temperature": temperature, "num_predict": num_predict},
+            # ponytail: thinking models (qwen3.x, deepseek-r1) spend the whole num_predict
+            # budget in message.thinking and return content:"" -> "empty LLM response".
+            # Off for everyone; non-thinking models ignore it. If a reasoning model is ever
+            # worth the wait, flip this per-call and raise num_predict to ~4000.
+            "think": False,
         }
         if as_json:
             payload["format"] = "json"
@@ -41,8 +46,9 @@ class Ollama:
                 raise LLMError("Ollama HTTP " + str(r.status_code) + ": " + r.text[:300])
             return (r.json().get("message") or {}).get("content", "")
 
-    async def json_chat(self, system, user, num_predict=700):
-        txt = await self.chat(system, user, as_json=True, num_predict=num_predict)
+    async def json_chat(self, system, user, num_predict=700, temperature=0.2):
+        txt = await self.chat(system, user, as_json=True, num_predict=num_predict,
+                              temperature=temperature)
         return parse_json(txt)
 
     async def health(self):
@@ -227,3 +233,235 @@ async def deep_analyze(llm, item, topic):
         + (item.get("content") or item.get("snippet") or "")[:8000]
     )
     return (await llm.chat(DEEP_SYS, user, as_json=False, num_predict=700)).strip()
+
+
+# --- LinkedIn post writer --------------------------------------------------
+
+LENGTHS = {"short": 70, "medium": 150, "long": 260}   # target words, hook plus body
+
+# Nine ways to say something about a discovery. Hardcoded on purpose: tuning one is a
+# one-line edit here, and an angle CRUD screen would be more code than the angles.
+ANGLES = {
+    "signal": {
+        "name": "Signal", "min_items": 1, "needs_take": False,
+        "blurb": "One development and what it changes.",
+        "how": "Report one concrete development and what it changes. Open with the change "
+               "itself, never with a claim about how important it is. Close on the "
+               "implication, stated flatly.",
+    },
+    "discovery": {
+        "name": "Discovery", "min_items": 1, "needs_take": False,
+        "blurb": "Something obscure that deserves attention. Pairs with the niche bucket.",
+        "how": "Surface something small or obscure and say what it is in plain terms "
+               "before saying why it is interesting. Be honest that it is early, unproven "
+               "or narrow. Close by naming exactly who should care and why.",
+    },
+    "field-notes": {
+        "name": "Field notes", "min_items": 1, "needs_take": True,
+        "blurb": "A practitioner account. Requires your take - the take IS the experience.",
+        "how": "Write a practitioner's account grounded entirely in YOUR TAKE. The take is "
+               "the experience; the source is background and must stay attributed to the "
+               "source. Include the friction, not only the result. Close on what you would "
+               "do differently next time.",
+    },
+    "teardown": {
+        "name": "Teardown", "min_items": 1, "needs_take": False,
+        "blurb": "Explain the mechanism plainly to a competent non-specialist.",
+        "how": "Explain how the thing actually works to a competent non-specialist. One "
+               "analogy at most, and only if it earns its place. Close on the trade-off "
+               "the mechanism buys and what it costs.",
+    },
+    "contrarian": {
+        "name": "Contrarian", "min_items": 1, "needs_take": False,
+        "blurb": "A common belief set against what the source states.",
+        "how": "Name a belief that is widely held in this field, state it fairly and "
+               "without caricature, then set it against what the source actually shows. "
+               "Close by conceding the strongest point on the other side.",
+    },
+    "provoke": {
+        "name": "Thought-provoker", "min_items": 1, "needs_take": False,
+        "blurb": "The second-order consequence nobody is discussing.",
+        "how": "State the first-order fact in one sentence, then spend the post on the "
+               "second-order consequence people are not discussing yet. Mark it clearly "
+               "as the author's reasoning. Close open-ended, as a statement, not a question.",
+    },
+    "ask": {
+        "name": "Ask the room", "min_items": 1, "needs_take": False,
+        "blurb": "A real question to the industry. The only angle that closes on a question.",
+        "how": "Give the context from the source, state the author's current lean and why "
+               "it is uncertain, then ask ONE specific answerable question. Not 'thoughts?' "
+               "- a question only someone with real experience could answer. This is the "
+               "only angle allowed to end on a question mark.",
+    },
+    "lesson": {
+        "name": "Lesson", "min_items": 1, "needs_take": False,
+        "blurb": "A transferable principle, with the source as its evidence.",
+        "how": "Extract one transferable principle. The source is the evidence, the "
+               "principle is the point, so do not let the retelling take over. Close on "
+               "where the principle stops applying.",
+    },
+    "synthesis": {
+        "name": "Synthesis", "min_items": 2, "needs_take": False,
+        "blurb": "Two or more finds connected into one pattern. Needs 2+ items.",
+        "how": "Connect every source given into one pattern. State the pattern first, then "
+               "each source as a line of evidence for it - do not summarise them in turn "
+               "as a list. Close on what the pattern predicts next.",
+    },
+}
+
+# Phrases that make a post read as engagement bait to the people it is aimed at.
+# Checked in the prompt and again in lint_post, because a local model will use one anyway.
+BANNED = [
+    "game changer", "game-changer", "let that sink in", "in today's fast-paced world",
+    "i'm humbled", "i am humbled", "thrilled to announce", "excited to announce",
+    "this is huge", "mind-blowing", "mind blowing", "revolutionary", "unlock the power",
+    "here's the thing", "the future of", "is here to stay", "needle-moving",
+    "deep dive into the world of", "buckle up", "read that again",
+    # observed coming out of qwen2.5:14b on the first real run
+    "check it out", "did you know", "intrigued?", "let's dive in", "stay tuned",
+]
+
+POST_SYS = """You write LinkedIn posts for a working practitioner. The reader is a peer,
+not a follower: they can tell instantly when a post is padded, hyped or machine-written.
+
+Return ONLY this JSON object:
+{
+ "hooks": ["opening line A", "opening line B", "opening line C"],
+ "body": "everything after the opening line",
+ "hashtags": ["Tag", "..."],
+ "first_comment": "the link plus one line on what is worth reading in it"
+}
+
+TRUTH
+- Every factual claim must come from the SOURCE material below. Never invent a number,
+  quote, benchmark, version, date, price, name or company.
+- Never claim personal experience, personal use, attendance or authorship unless YOUR TAKE
+  says so. If YOUR TAKE is "(none given)", write as someone who read the source - not as
+  someone who used the thing.
+- Interpretation is welcome but must read as the author's opinion, never as reported fact.
+- If the source is too thin to support the requested angle, say so plainly in the body
+  instead of inventing substance to fill the length.
+
+FORM
+- The three hooks are three genuinely different openings, not one sentence reworded.
+- Each hook stands alone, is at most 200 characters, and works before LinkedIn truncates
+  the post at "see more".
+- "body" does not repeat the hook. It begins with the sentence that follows it.
+- One idea per post. Paragraphs of one or two sentences, separated by a blank line.
+- Name the source publication or author in the text: the link goes in the first comment,
+  not in the post.
+- No emoji anywhere, including as bullets.
+- Do not end on a question unless the angle explicitly calls for one.
+- Never use these phrases: """ + "; ".join(BANNED)
+
+
+def _persona_block(settings):
+    """Only the fields you actually filled in. Sending blanks teaches the model that an
+    empty author profile is normal, and it writes to that."""
+    fields = [("Role", "persona_role"), ("Speaks credibly on", "persona_expertise"),
+              ("Writing for", "persona_audience"), ("Voice", "persona_voice"),
+              ("Never says", "persona_avoid")]
+    lines = [label + ": " + str(settings.get(key) or "").strip()
+             for label, key in fields if str(settings.get(key) or "").strip()]
+    out = ""
+    if lines:
+        # Not "AUTHOR": each SOURCE block already has an AUTHOR field meaning the person
+        # who wrote the article, and the model must not confuse them for each other.
+        out += "WHO IS WRITING THIS POST\n" + "\n".join(lines) + "\n"
+    sample = str(settings.get("persona_sample") or "").strip()
+    if sample:
+        out += ("STYLE SAMPLE - the author's own writing. Match its rhythm and register.\n"
+                "Do NOT reuse its content or subject:\n" + sample[:800] + "\n")
+    return out
+
+
+def _source_block(items):
+    """Per-source text budget shrinks with the selection, so a five-item synthesis still
+    fits a local model's context instead of silently losing the last sources."""
+    budget = max(600, 6000 // max(1, len(items)))
+    out = []
+    for n, it in enumerate(items, 1):
+        facts = it.get("llm_facts") or []
+        out.append(
+            "SOURCE " + str(n) + "\n"
+            "TITLE: " + str(it.get("title") or "") + "\n"
+            "PUBLICATION: " + str(it.get("domain") or "") + "\n"
+            "AUTHOR: " + str(it.get("author") or "unknown") + "\n"
+            "PUBLISHED: " + str(it.get("published_at") or "unknown") + "\n"
+            "URL: " + str(it.get("url") or "") + "\n"
+            "FACTS STATED IN THE SOURCE:\n"
+            + ("".join("  - " + str(f)[:300] + "\n" for f in facts) or "  (none extracted)\n")
+            + "SUMMARY: " + str(it.get("llm_summary") or it.get("snippet") or "") + "\n"
+            "TEXT:\n" + (it.get("content") or it.get("snippet") or "")[:budget]
+        )
+    return "\n\n".join(out)
+
+
+def build_post_user(items, angle, length="medium", hashtags_on=True, take="", settings=None):
+    a = ANGLES[angle]
+    words = LENGTHS.get(length, LENGTHS["medium"])
+    tags = ("Pick 3-5 hashtags that a specialist would actually follow. No generic ones "
+            "(innovation, technology, motivation, leadership)."
+            if hashtags_on else "Return an empty hashtags list.")
+    return (
+        _persona_block(settings or {})
+        + "\nANGLE: " + a["name"] + "\n" + a["how"] + "\n"
+        "TARGET LENGTH: about " + str(words) + " words for hook plus body.\n"
+        "HASHTAGS: " + tags + "\n"
+        "YOUR TAKE (the author's own angle - make it the spine of the post): "
+        + (str(take or "").strip() or "(none given)") + "\n\n"
+        + _source_block(items)
+    )
+
+
+async def write_post(llm, items, angle, length="medium", hashtags_on=True, take="",
+                     settings=None):
+    user = build_post_user(items, angle, length, hashtags_on, take, settings)
+    # Warmer than the judge: three hooks at temperature 0.2 come back as one hook
+    # reworded twice, which defeats the point of offering a choice.
+    d = await llm.json_chat(POST_SYS, user, num_predict=900, temperature=0.8)
+    if not isinstance(d, dict):
+        raise LLMError("post writer returned non-object")
+    body = str(d.get("body") or "").strip()
+    hooks = [" ".join(str(h).split()) for h in (d.get("hooks") or []) if str(h).strip()][:3]
+    if not hooks:
+        # A model that ignored the hooks field still wrote a post: its first line is the
+        # hook. Splitting it off beats failing the request over a schema slip.
+        first, _, rest = body.partition("\n")
+        hooks, body = [first.strip()], rest.strip()
+    tags = [str(t).lstrip("#").strip()[:40] for t in (d.get("hashtags") or []) if str(t).strip()]
+    return {
+        "hooks": hooks,
+        "body": body,
+        "hashtags": tags[:5] if hashtags_on else [],
+        "first_comment": str(d.get("first_comment") or "").strip()[:600],
+        "model": llm.model,
+    }
+
+
+# Pictographs, dingbats and symbols. Arrows (U+2190-21FF) are deliberately NOT in here:
+# "->" rendered as an arrow is ordinary technical writing, not engagement bait.
+EMOJI_RE = re.compile("[\U0001f000-\U0001faff⌀-➿⬀-⯿️☀-⛿]")
+
+
+def lint_post(hook, body, hashtags, angle):
+    """Advisory checks on a draft. Never blocks: the UI shows these beside Regenerate,
+    because a human reads a bad post faster than a retry loop can rewrite one."""
+    warn = []
+    text = str(hook or "") + "\n" + str(body or "")
+    low = text.lower()
+    hits = sorted(p for p in BANNED if p in low)
+    if hits:
+        warn.append("cliche: " + ", ".join('"' + h + '"' for h in hits))
+    if EMOJI_RE.search(text):
+        warn.append("contains emoji - reads as engagement bait to this audience")
+    if len(hook or "") > 220:
+        warn.append("hook is " + str(len(hook)) + " chars - LinkedIn cuts around 200")
+    if len(hashtags or []) > 5:
+        warn.append(str(len(hashtags)) + " hashtags - 3 to 5 reads deliberate, more reads spam")
+    lines = [ln for ln in str(body or "").strip().splitlines() if ln.strip()]
+    if angle != "ask" and lines and lines[-1].rstrip().endswith("?"):
+        warn.append("closes on a question - only the 'ask the room' angle should")
+    if len(str(body or "").split()) > 120 and str(body or "").count("\n\n") < 2:
+        warn.append("one wall of text - break it into one or two sentence paragraphs")
+    return warn

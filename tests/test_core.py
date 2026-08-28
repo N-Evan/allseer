@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from allseer import db, extract, pipeline, providers, rank
+from allseer import db, extract, llm, pipeline, providers, rank
 from allseer.dedupe import canon_url, cluster, jaccard, pick_representatives, title_tokens
 from allseer.llm import _examples_block, parse_json, fallback_queries
 
@@ -533,6 +533,192 @@ def test_stage_timings_accumulate_across_topics():
     except ValueError:
         pass
     assert "search" in stats["secs"]
+
+
+# --- LinkedIn post writer -------------------------------------------------
+
+CLEAN_BODY = ("Godot 4.4 lands its rewritten navigation server, per the engine blog.\n\n"
+              "Pathfinding now runs off the main thread, which is the part that mattered "
+              "for anyone shipping large levels.\n\n"
+              "The trade is a migration: the old NavigationServer calls are gone.")
+
+
+def test_angles_and_lengths_are_well_formed():
+    assert len(llm.ANGLES) >= 9
+    for key, a in llm.ANGLES.items():
+        assert key == key.lower() and " " not in key, key
+        for field in ("name", "how", "blurb", "min_items", "needs_take"):
+            assert a.get(field) not in (None, ""), (key, field)
+        assert a["min_items"] >= 1
+        assert isinstance(a["needs_take"], bool)
+    assert llm.ANGLES["synthesis"]["min_items"] == 2, "synthesis is the multi-item angle"
+    assert llm.ANGLES["field-notes"]["needs_take"] is True, "field notes IS the take"
+    # the three the UI offers, and no others
+    assert set(llm.LENGTHS) == {"short", "medium", "long"}
+    assert llm.LENGTHS["short"] < llm.LENGTHS["medium"] < llm.LENGTHS["long"]
+
+
+def test_lint_post_flags_what_makes_a_post_look_generated():
+    def w(hook="A real hook.", body=CLEAN_BODY, tags=("Godot",), angle="signal"):
+        return " | ".join(llm.lint_post(hook, body, list(tags), angle))
+
+    assert "cliche" in w(body="This is huge. " + CLEAN_BODY)
+    assert "cliche" in w(hook="Game changer.")
+    assert "emoji" in w(hook="We shipped it \U0001f680")
+    assert "chars" in w(hook="x" * 300)
+    assert "hashtags" in w(tags=("a", "b", "c", "d", "e", "f", "g"))
+    assert "question" in w(body=CLEAN_BODY + "\n\nThoughts?")
+    # the same closing question is correct for the one angle that asks for it
+    assert "question" not in w(body=CLEAN_BODY + "\n\nThoughts?", angle="ask")
+    assert "wall of text" in w(body=" ".join(["word"] * 200))
+    # an arrow is technical writing, not engagement bait
+    assert w(body=CLEAN_BODY.replace("The trade is", "old -> new. The trade is")) == ""
+
+
+def test_lint_post_passes_a_clean_draft():
+    assert llm.lint_post("Godot 4.4 moved pathfinding off the main thread.",
+                         CLEAN_BODY, ["Godot", "GameDev", "Navigation"], "signal") == []
+
+
+def test_post_prompt_omits_empty_persona_fields():
+    item = {"title": "T", "domain": "d.io", "url": "https://d.io/a",
+            "llm_facts": ["fact one"], "llm_summary": "s", "content": "x" * 20000}
+    bare = llm.build_post_user([item], "signal", settings={})
+    assert "WHO IS WRITING" not in bare and "STYLE SAMPLE" not in bare
+    assert "(none given)" in bare, "an absent take must be stated, not implied"
+    full = llm.build_post_user([item], "signal", take="I shipped this", settings={
+        "persona_role": "Gameplay engineer", "persona_voice": "dry",
+        "persona_sample": "I ship things.", "persona_audience": ""})
+    assert "Role: Gameplay engineer" in full and "Voice: dry" in full
+    assert "I ship things." in full and "I shipped this" in full
+    assert "Writing for" not in full, "an empty persona field must not reach the prompt"
+
+
+def test_post_prompt_budget_shrinks_with_more_sources():
+    item = {"title": "T", "domain": "d.io", "url": "https://d.io/a",
+            "llm_facts": [], "llm_summary": "s", "content": "x" * 20000}
+    one = llm.build_post_user([item], "signal", settings={})
+    five = llm.build_post_user([item] * 5, "synthesis", settings={})
+    assert five.count("SOURCE ") == 5
+    # four extra sources must not multiply the prompt: they share one text budget
+    assert len(five) < len(one) + 2000, (len(one), len(five))
+
+
+def test_parse_json_reads_a_fenced_post_response():
+    d = parse_json('```json\n{"hooks": ["a", "b", "c"], "body": "text",\n'
+                   ' "hashtags": ["Godot"], "first_comment": "link"}\n```')
+    assert d["hooks"] == ["a", "b", "c"] and d["body"] == "text"
+
+
+def test_posts_table_round_trip():
+    with temp_db():
+        pid = db.insert_post({"item_ids": [3, 4], "titles": ["A", "B"], "angle": "synthesis",
+                              "length": "medium", "hashtags_on": True, "take": "my angle",
+                              "hooks": ["h1", "h2"], "body": "body text",
+                              "hashtags": ["Godot"], "first_comment": "link",
+                              "warnings": ["cliche"], "model": "qwen2.5:14b"})
+        p = db.get_post(pid)
+        assert p["item_ids"] == [3, 4] and p["titles"] == ["A", "B"]
+        assert p["hooks"] == ["h1", "h2"] and p["warnings"] == ["cliche"]
+        assert p["edited"] == "", "a fresh draft has no edit yet"
+        assert [x["id"] for x in db.list_posts()] == [pid]
+
+        assert db.update_post(pid, "my edited version") is True
+        assert db.get_post(pid)["edited"] == "my edited version"
+        assert db.update_post(pid + 99, "x") is False
+
+        assert db.delete_post(pid) is True
+        assert db.get_post(pid) is None and db.list_posts() == []
+        assert db.delete_post(pid) is False
+
+
+def test_items_by_ids_keeps_order_and_decodes_facts():
+    with temp_db():
+        r = db.start_run("2026-08-28")
+        ids = [i for i, _ in db.insert_items(r, [
+            {"canon_url": "https://a.io/1", "title": "First", "llm_facts": ["f1", "f2"]},
+            {"canon_url": "https://b.io/2", "title": "Second", "llm_facts": []},
+        ])]
+        got = db.items_by_ids([ids[1], ids[0]])
+        assert [g["title"] for g in got] == ["Second", "First"], "order follows the request"
+        assert got[1]["llm_facts"] == ["f1", "f2"], "facts arrive as a list, not JSON text"
+        # a stale selection comes back short, which is how the API detects it
+        assert len(db.items_by_ids([ids[0], 999999])) == 1
+
+
+def test_post_api_rejects_impossible_requests():
+    with temp_db():
+        from fastapi.testclient import TestClient
+
+        from allseer import app as app_mod
+        c = TestClient(app_mod.app)
+
+        r = db.start_run("2026-08-28")
+        [(iid, _)] = db.insert_items(r, [{"canon_url": "https://a.io/1", "title": "One"}])
+
+        def post(**kw):
+            body = {"item_ids": [iid], "angle": "signal", "length": "medium"}
+            body.update(kw)
+            return c.post("/api/posts", json=body)
+
+        assert post(angle="nonsense").status_code == 400
+        assert post(angle="").status_code == 400
+        assert post(length="epic").status_code == 400
+        assert post(angle="synthesis").status_code == 400, "synthesis needs 2+ items"
+        assert post(angle="field-notes").status_code == 400, "field notes needs a take"
+        assert post(item_ids=[]).status_code == 400
+        assert post(item_ids=[999999]).status_code == 400, "stale item id"
+        assert post(item_ids=["not-an-int"]).status_code == 400
+
+        # the angle list the UI builds itself from
+        a = c.get("/api/angles").json()
+        assert {x["key"] for x in a["angles"]} == set(llm.ANGLES)
+        assert a["lengths"] == llm.LENGTHS
+        assert c.get("/api/posts").json() == {"posts": []}
+        assert c.put("/api/posts/1", json={"edited": "x"}).status_code == 404
+        assert c.delete("/api/posts/1").status_code == 404
+
+
+def test_every_hook_is_linted_not_only_the_first():
+    """A cliche in hook 3 is one radio click from being published, so it has to be
+    flagged too - and named by number, or you cannot tell which hook to skip."""
+    hooks = ["A clean, specific opening line.", "Check it out!", "We shipped it \U0001f680"]
+    warn = llm.lint_post(hooks[0], CLEAN_BODY, ["Godot"], "signal")
+    for n, h in enumerate(hooks[1:], 2):
+        warn += ["hook " + str(n) + ": " + w for w in llm.lint_post(h, "", [], "signal")]
+    joined = " | ".join(warn)
+    assert "hook 2: cliche" in joined, joined
+    assert "hook 3: contains emoji" in joined, joined
+    assert not any(w.startswith("hook 1") for w in warn), "hook 1 is reported unprefixed"
+
+
+def test_post_api_lints_and_stores_the_draft():
+    """The endpoint's own wiring: lint every hook, denormalise the titles, persist."""
+    with temp_db():
+        from fastapi.testclient import TestClient
+
+        from allseer import app as app_mod
+        c = TestClient(app_mod.app)
+        r = db.start_run("2026-08-28")
+        [(iid, _)] = db.insert_items(r, [{"canon_url": "https://a.io/1", "title": "One"}])
+
+        async def fake_write_post(*a, **kw):
+            return {"hooks": ["A clean, specific opening line.", "Check it out!"],
+                    "body": CLEAN_BODY, "hashtags": ["Godot"],
+                    "first_comment": "https://a.io/1 - worth reading", "model": "test"}
+
+        original = app_mod.llm_mod.write_post
+        app_mod.llm_mod.write_post = fake_write_post
+        try:
+            p = c.post("/api/posts", json={"item_ids": [iid], "angle": "signal",
+                                           "length": "medium"}).json()
+        finally:
+            app_mod.llm_mod.write_post = original
+
+        assert p["warnings"] == ['hook 2: cliche: "check it out"'], p["warnings"]
+        assert p["titles"] == ["One"], "the title is copied in, so a deleted item is survivable"
+        assert p["item_ids"] == [iid]
+        assert db.get_post(p["id"])["hooks"] == p["hooks"], "the draft is stored, not just returned"
 
 
 if __name__ == "__main__":

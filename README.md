@@ -2,7 +2,8 @@
 
 Fully local research/trend monitor. For each topic you configure it finds **today's top 3
 stories** plus **3-5 niche finds** worth investigating, summarises them with a local LLM,
-and stores everything in SQLite for browsing.
+and stores everything in SQLite for browsing. The **Write** tab turns any of them into a
+LinkedIn draft in your own voice.
 
 No paid APIs, no cloud, no accounts, no Docker required.
 
@@ -196,6 +197,60 @@ browser tab is a run you have to remember to open; the same content on disk is r
 a phone, greppable from a shell, and outlives the database. Set `digest_dir` blank to turn
 it off.
 
+## Writing a LinkedIn post about a find (Write tab)
+
+Research surfaces the material; the **Write** tab turns a find into a post you would not be
+embarrassed to publish.
+
+Tick one item for a single-source post, or two or more for a **synthesis** that connects
+them into one pattern. Pick an angle, a length and whether you want hashtags, add your own
+take in one line, and generate. You get **three different hooks** to choose between, an
+editable body, the hashtags, and the text for the **first comment** - the link goes there,
+because LinkedIn throttles posts that send people off-platform.
+
+Nine angles, hardcoded in `allseer/llm.py` so tuning one is a one-line edit:
+
+| Angle | What it writes | Closes on |
+|---|---|---|
+| Signal | one development and what it changes | the implication |
+| Discovery | something obscure, in plain terms, honestly early | who should care |
+| Field notes | a practitioner account - **requires your take**, the take is the experience | what you'd do differently |
+| Teardown | how the thing works, for a competent non-specialist | the trade-off it buys |
+| Contrarian | a common belief set fairly against what the source shows | the strongest counterpoint |
+| Thought-provoker | the second-order consequence nobody is discussing | open, as a statement |
+| Ask the room | context, your lean, then one answerable question | the only angle that ends on `?` |
+| Lesson | a transferable principle, source as evidence | where it stops applying |
+| Synthesis | 2+ finds as one pattern (needs 2+ items) | what the pattern predicts |
+
+### Why the output does not read as AI slop
+
+Three things, in order of how much they matter:
+
+1. **Your author profile.** The six `persona_*` settings - role, expertise, audience, voice,
+   a paragraph of your own writing, and phrases you never use. `persona_sample` does the
+   most work of any single setting in the app: it is the only thing in the prompt that
+   knows how *you* sound. Leave them blank and every post is written from the article
+   alone, which is exactly the generic case this exists to avoid. The Write tab says so
+   until you fill them in. Empty fields are never sent.
+2. **Fixed prompt rules.** Facts only from the source - no invented number, quote,
+   benchmark, version or date. Never claims you used or attended anything unless your take
+   says so. One idea, short paragraphs, no emoji, the source named in the text, no closing
+   question except on `ask`, and a banned-phrase list (`game changer`, `let that sink in`,
+   `thrilled to announce`, `check it out`, and friends).
+3. **A lint pass over the result.** Every hook - not just the first - plus the body and
+   hashtags are checked for banned phrases, emoji, an over-long hook, hashtag spam, a bait
+   question, and wall-of-text formatting. Findings show as amber chips beside
+   **Regenerate**. They never block: you read a bad post faster than a retry loop rewrites
+   one.
+
+Drafts are stored in the `posts` table and listed under the composer, so a good one from
+last week is still there. Item titles are copied into the draft, so it stays readable even
+if the topic that found it is deleted.
+
+Post writing is one LLM call awaited directly, not a pipeline run - you can write a post
+while research is running. It uses `analysis_model` if set. On `qwen2.5:14b` expect
+20-60 seconds.
+
 ## What it does not download twice
 
 `max_fetch` is 40 pages a topic and at most 8 items are ever promoted, so most of every
@@ -262,6 +317,7 @@ Every card separates them on purpose:
 | `page_cache_days` | reuse page text fetched this recently instead of downloading it again; `0` = always refetch |
 | `dislike_drop` | net downvotes that ban a domain from every future run (`3`); `0` = soft bias only |
 | `digest_dir` | folder for the per-run markdown digest (`digests`); blank = off |
+| `persona_role`, `persona_expertise`, `persona_audience`, `persona_voice`, `persona_sample`, `persona_avoid` | who is writing the LinkedIn posts. `persona_sample` - a paragraph of your own writing - is the single highest-leverage field in this table |
 
 A run with `max_llm=35` on an 8B model takes roughly 5-15 minutes. Start smaller.
 
@@ -303,7 +359,7 @@ allseer/db.py           SQLite schema, settings, votes, page cache, FTS helpers
 allseer/providers.py    search providers (add one here)
 allseer/extract.py      page fetch + text extraction
 allseer/dedupe.py       URL identity + same-story clustering
-allseer/llm.py          Ollama client + the 3 prompts
+allseer/llm.py          Ollama client + the 4 prompts, post angles, draft lint
 allseer/rank.py         scoring formulas + list selection
 allseer/pipeline.py     the run, start to finish
 allseer/app.py          FastAPI API + dashboard host
@@ -314,8 +370,8 @@ digests/                one markdown file per run
 ```
 
 Tables in `allseer.db`: `topics`, `runs`, `items`, `settings`, `feedback` (your votes,
-keyed by canonical URL), `page_cache` (extracted text, reused across runs), and
-`items_fts` (the search index over `items`).
+keyed by canonical URL), `page_cache` (extracted text, reused across runs), `items_fts`
+(the search index over `items`), and `posts` (your LinkedIn drafts).
 
 ## Scheduling (optional)
 

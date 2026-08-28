@@ -104,6 +104,27 @@ CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
   INSERT INTO items_fts(items_fts, rowid, title, snippet, llm_summary, llm_tags, domain)
   VALUES ('delete', old.id, old.title, old.snippet, old.llm_summary, old.llm_tags, old.domain);
 END;
+
+-- LinkedIn drafts. titles is denormalised on purpose: deleting a topic takes its items
+-- with it, and a draft should still say what it was written from.
+CREATE TABLE IF NOT EXISTS posts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT DEFAULT (datetime('now')),
+  item_ids TEXT DEFAULT '[]',
+  titles TEXT DEFAULT '[]',
+  angle TEXT,
+  length TEXT,
+  hashtags_on INTEGER DEFAULT 1,
+  take TEXT DEFAULT '',
+  hooks TEXT DEFAULT '[]',
+  body TEXT DEFAULT '',
+  hashtags TEXT DEFAULT '[]',
+  first_comment TEXT DEFAULT '',
+  edited TEXT DEFAULT '',
+  warnings TEXT DEFAULT '[]',
+  model TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(id DESC);
 """
 
 # Feeds beat search APIs for gamedev/devlog material: they are complete, dated and free.
@@ -149,7 +170,7 @@ JOB_FEEDS = [
 
 DEFAULT_SETTINGS = {
     "ollama_url": "http://localhost:11434",
-    "ollama_model": "qwen2.5:14b",
+    "ollama_model": "qwen3.5:latest",
     "analysis_model": "",       # model for judging + analyst notes; empty = ollama_model
     "searxng_url": "",  # e.g. http://localhost:8080 - optional, other providers work without it
     "queries_per_topic": "6",
@@ -167,6 +188,14 @@ DEFAULT_SETTINGS = {
     "providers": "hn,reddit,github,arxiv,searxng,rss",
     "rss_feeds": " ".join(DEFAULT_FEEDS),
     "user_agent": "allseer/0.1 (personal research agent)",
+    # Author profile for the LinkedIn writer. Empty means posts are written from the
+    # article alone, which is the generic-sounding case the writer exists to avoid.
+    "persona_role": "My role is a software engineer and game developer, and I write about software engineering, game development, and AI-driven systems.",
+    "persona_expertise": "A software engineer with 5 years of experience in game development, AI-driven systems, software architecture and project lead and management.",
+    "persona_audience": "Engineers, developers, and tech enthusiasts interested in software engineering, game development, and AI-driven systems. And recruiters",
+    "persona_voice": "Friendly, humble.",
+    "persona_sample": "It's cinema alright, but there's no urge or drive to play this. Gunplay looks like it's directly copy pasted from Max Payne 3. Graphically, nothing to say there. In general, gameplay wise, yay, more interactions, where GTA is more like RE-esque with a ton more elements.",
+    "persona_avoid": "Egoistic, overly technical, or condescending.",
 }
 
 # Exclusions shared by every topic: the noise that follows any tech query around.
@@ -555,3 +584,94 @@ def fts_query(text):
     # Trailing * on the last token = prefix search, so "godo" finds "godot" while typing.
     body = ['"' + t + '"' for t in toks[:-1]] + ['"' + toks[-1] + '"*']
     return " AND ".join(body)
+
+
+# --- LinkedIn drafts ------------------------------------------------------
+
+POST_JSON_COLS = ("item_ids", "titles", "hooks", "hashtags", "warnings")
+
+
+def _post_row(r):
+    d = dict(r)
+    for c in POST_JSON_COLS:
+        try:
+            d[c] = json.loads(d.get(c) or "[]")
+        except (TypeError, json.JSONDecodeError):
+            d[c] = []
+    return d
+
+
+def insert_post(d):
+    con = connect()
+    with con:
+        cur = con.execute(
+            "INSERT INTO posts(item_ids,titles,angle,length,hashtags_on,take,hooks,body,"
+            "hashtags,first_comment,warnings,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (json.dumps(list(d.get("item_ids") or [])),
+             json.dumps(list(d.get("titles") or [])),
+             d.get("angle"), d.get("length"), int(bool(d.get("hashtags_on", True))),
+             d.get("take") or "", json.dumps(list(d.get("hooks") or [])),
+             d.get("body") or "", json.dumps(list(d.get("hashtags") or [])),
+             d.get("first_comment") or "", json.dumps(list(d.get("warnings") or [])),
+             d.get("model")),
+        )
+    pid = cur.lastrowid
+    con.close()
+    return pid
+
+
+def get_post(post_id):
+    con = connect()
+    r = con.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+    con.close()
+    return _post_row(r) if r else None
+
+
+def list_posts(limit=50):
+    con = connect()
+    rows = con.execute("SELECT * FROM posts ORDER BY id DESC LIMIT ?",
+                       (max(1, min(int(limit), 200)),)).fetchall()
+    con.close()
+    return [_post_row(r) for r in rows]
+
+
+def update_post(post_id, edited):
+    con = connect()
+    with con:
+        cur = con.execute("UPDATE posts SET edited=? WHERE id=?", (edited or "", post_id))
+    n = cur.rowcount
+    con.close()
+    return n > 0
+
+
+def delete_post(post_id):
+    con = connect()
+    with con:
+        cur = con.execute("DELETE FROM posts WHERE id=?", (post_id,))
+    n = cur.rowcount
+    con.close()
+    return n > 0
+
+
+def items_by_ids(ids):
+    """Source items for a draft, returned in the order asked for. Missing ids are simply
+    absent, so the caller can compare lengths and reject a stale selection."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return []
+    con = connect()
+    rows = {r["id"]: dict(r) for r in con.execute(
+        "SELECT * FROM items WHERE id IN (" + ",".join("?" * len(ids)) + ")", ids)}
+    con.close()
+    out = []
+    for i in ids:
+        it = rows.get(i)
+        if not it:
+            continue
+        for c in ("llm_facts", "llm_tags"):
+            try:
+                it[c] = json.loads(it.get(c) or "[]")
+            except (TypeError, json.JSONDecodeError):
+                it[c] = []
+        out.append(it)
+    return out
