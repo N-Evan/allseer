@@ -186,3 +186,8 @@ allseer.db
 
 # per-run markdown digests
 digests/
+
+# local llama.cpp build + model weights (llama.ps1 defaults)
+llama.cpp/
+models/
+*.gguf

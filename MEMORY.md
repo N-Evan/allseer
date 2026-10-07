@@ -7,7 +7,7 @@ re-derive what is here.
 
 Local research/trend monitor. Per topic: today's top 3 trending stories + 3-5 niche finds,
 summarised and scored by a local LLM, stored in SQLite, browsed in a single-page dashboard.
-Python + FastAPI + Ollama + SQLite. No Docker, no keys, no auth, no build step.
+Python + FastAPI + local LLM (OpenAI-compatible API: llama.cpp or Ollama) + SQLite. No Docker, no keys, no auth, no build step.
 
 Run: `python run.py` -> http://127.0.0.1:8077 -> "Run Research Now".
 Headless: `python run.py --once`. Tests: `python tests/test_core.py`.
@@ -266,5 +266,5 @@ put those phrases in `BANNED`.
 
 `run.py` launcher | `allseer/db.py` schema+settings | `providers.py` search |
 `extract.py` fetch+text | `dedupe.py` URL identity+clustering |
-`llm.py` Ollama+4 prompts+post angles+lint | `rank.py` formulas+selection |
+`llm.py` LLM client+4 prompts+post angles+lint | `rank.py` formulas+selection |
 `pipeline.py` the run | `app.py` API | `static/index.html` UI

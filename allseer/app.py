@@ -264,7 +264,7 @@ async def create_post(body: dict):
         raise HTTPException(400, "one of the selected items no longer exists")
     hashtags_on = bool(body.get("hashtags_on", True))
     s = db.get_settings()
-    llm = llm_mod.Ollama(s["ollama_url"], s.get("analysis_model") or s["ollama_model"])
+    llm = llm_mod.LLM(s["llm_url"], s.get("analysis_model") or s["llm_model"])
     out = await llm_mod.write_post(llm, items, angle, length, hashtags_on, take, s)
     warn = llm_mod.lint_post(out["hooks"][0] if out["hooks"] else "",
                              out["body"], out["hashtags"], angle)
@@ -301,18 +301,18 @@ def remove_post(post_id: int):
 
 @app.post("/api/settings")
 def settings(body: dict):
-    db.save_settings(body or {})
-    return {"ok": True, "settings": db.get_settings()}
+    ignored = db.save_settings(body or {})
+    return {"ok": True, "ignored": ignored, "settings": db.get_settings()}
 
 
 @app.get("/api/health")
 async def health():
     s = db.get_settings()
-    out = {"ollama": {"ok": False}, "searxng": {"configured": bool(s.get("searxng_url"))}}
+    out = {"llm": {"ok": False}, "searxng": {"configured": bool(s.get("searxng_url"))}}
     try:
-        out["ollama"] = await llm_mod.Ollama(s["ollama_url"], s["ollama_model"]).health()
+        out["llm"] = await llm_mod.LLM(s["llm_url"], s["llm_model"]).health()
     except Exception as e:
-        out["ollama"] = {"ok": False, "error": type(e).__name__ + ": " + str(e)[:200]}
+        out["llm"] = {"ok": False, "error": type(e).__name__ + ": " + str(e)[:200]}
     return out
 
 

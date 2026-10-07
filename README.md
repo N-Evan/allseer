@@ -10,8 +10,12 @@ No paid APIs, no cloud, no accounts, no Docker required.
 ## Setup (Windows, no Docker)
 
 ```powershell
-# 1. Ollama - install from https://ollama.com, then pull a model
-ollama pull qwen2.5:14b        # or llama3.1:8b / gemma3:12b - anything you have
+# 1. A local LLM server speaking the OpenAI chat API. Either works.
+#    a) llama.cpp - download the CUDA build for your GPU from
+#       https://github.com/ggml-org/llama.cpp/releases, unzip, then:
+powershell -ExecutionPolicy Bypass -File .\llama.ps1   # edit paths/model inside first
+#    b) Ollama - install from https://ollama.com, pull a model, and set
+#       llm_url to http://localhost:11434 in Settings.
 
 # 2. Python deps
 python -m pip install -r requirements.txt
@@ -112,7 +116,7 @@ If it is unreachable the run logs the failure and continues with the other provi
   same pipeline and stored in history, but never saved as a topic. Your exact wording is
   used as the first search query, then the LLM generates angles around it.
 - **Stop** - appears while a run is in progress and cancels it immediately, including the
-  search, page fetch or Ollama call in flight. The run is marked `cancelled`; whatever was
+  search, page fetch or LLM call in flight. The run is marked `cancelled`; whatever was
   already stored stays browsable.
 
 Only one run happens at a time - starting a second returns 409 rather than queueing.
@@ -302,8 +306,8 @@ Every card separates them on purpose:
 
 | Setting | Meaning |
 |---|---|
-| `ollama_url`, `ollama_model` | local LLM; `ollama_model` writes the search queries |
-| `analysis_model` | model used for judging and the analyst notes; blank = same as `ollama_model`. Query generation is cheap and forgiving, judging is where a bigger model shows |
+| `llm_url`, `llm_model` | local LLM server, any OpenAI-compatible one. llama-server ignores `llm_model` and serves whatever it loaded; Ollama uses it to pick |
+| `analysis_model` | model used for judging and the analyst notes; blank = same as `llm_model`. Query generation is cheap and forgiving, judging is where a bigger model shows. Differing from `llm_model` needs a backend that holds two models - a second llama-server on another port, or Ollama |
 | `searxng_url` | optional, blank = off |
 | `queries_per_topic` | search angles generated per topic (6 is a good default) |
 | `max_fetch` | pages downloaded per topic |
@@ -359,7 +363,7 @@ allseer/db.py           SQLite schema, settings, votes, page cache, FTS helpers
 allseer/providers.py    search providers (add one here)
 allseer/extract.py      page fetch + text extraction
 allseer/dedupe.py       URL identity + same-story clustering
-allseer/llm.py          Ollama client + the 4 prompts, post angles, draft lint
+allseer/llm.py          LLM client (OpenAI API) + the 4 prompts, post angles, draft lint
 allseer/rank.py         scoring formulas + list selection
 allseer/pipeline.py     the run, start to finish
 allseer/app.py          FastAPI API + dashboard host
@@ -385,6 +389,6 @@ schtasks /create /tn allseer /tr "python C:\path\to\allseer\run.py --once" /sc d
 ## Failure behaviour
 
 Nothing in a run is fatal. Provider errors, 403s, paywalls, JS-only pages, unparseable
-dates, a stopped Ollama, and bad JSON from a small model are all logged to the progress
+dates, a stopped LLM server, and bad JSON from a small model are all logged to the progress
 panel and the run continues with what it has. If the LLM is down entirely you still get
 searched, deduplicated, unscored discoveries under "Everything discovered".

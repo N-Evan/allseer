@@ -112,11 +112,11 @@ async def run_research(topic_ids=None, ad_hoc=None):
     if seen:
         log("suppressing " + str(len(seen)) + " links already ranked in the last "
             + str(seen_days) + " days")
-    llm = llm_mod.Ollama(settings["ollama_url"], settings["ollama_model"])
+    llm = llm_mod.LLM(settings["llm_url"], settings["llm_model"])
     # Query generation is cheap and forgiving; judging and the analyst note are where a
     # better model actually shows. Empty analysis_model means "same model for both".
-    analyst = llm_mod.Ollama(settings["ollama_url"],
-                             settings.get("analysis_model") or settings["ollama_model"])
+    analyst = llm_mod.LLM(settings["llm_url"],
+                          settings.get("analysis_model") or settings["llm_model"])
     if analyst.model != llm.model:
         log("analysis model: " + analyst.model + " (queries: " + llm.model + ")")
 
@@ -135,12 +135,12 @@ async def run_research(topic_ids=None, ad_hoc=None):
         async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
             try:
                 h = await llm.health()
-                log("ollama ok, model present: " + str(h["model_present"]))
+                log("llm ok, serving: " + (", ".join(h["models"][:4]) or "?"))
                 if not h["model_present"]:
-                    log("WARNING: model '" + llm.model + "' not pulled. Available: "
+                    log("WARNING: model '" + llm.model + "' not served. Available: "
                         + ", ".join(h["models"][:8]))
             except Exception as e:
-                log("WARNING: ollama unreachable (" + type(e).__name__ + "). "
+                log("WARNING: LLM server unreachable (" + type(e).__name__ + "). "
                     "Falling back to template queries; items will not be scored.")
 
             for topic in all_topics:
@@ -418,7 +418,7 @@ def start_background(topic_ids=None, ad_hoc=None):
 
 def stop():
     """Cancel the in-flight run. Cancelling the task interrupts whatever it is awaiting
-    (a search, a page fetch, an Ollama call), so this takes effect immediately."""
+    (a search, a page fetch, an LLM call), so this takes effect immediately."""
     if _TASK is None or _TASK.done():
         return False
     _TASK.cancel()

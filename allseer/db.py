@@ -169,9 +169,10 @@ JOB_FEEDS = [
 ]
 
 DEFAULT_SETTINGS = {
-    "ollama_url": "http://localhost:11434",
-    "ollama_model": "qwen3.5:latest",
-    "analysis_model": "",       # model for judging + analyst notes; empty = ollama_model
+    "llm_url": "http://127.0.0.1:8081",   # llama.ps1 pins llama-server here: 8080 is
+                                          # SearXNG, 8077 is allseer. Ollama is :11434
+    "llm_model": "local",       # llama-server ignores this and serves what it loaded
+    "analysis_model": "",       # model for judging + analyst notes; empty = llm_model
     "searxng_url": "",  # e.g. http://localhost:8080 - optional, other providers work without it
     "queries_per_topic": "6",
     "max_fetch": "40",
@@ -304,6 +305,10 @@ def init():
     con = connect()
     with con:
         con.executescript(SCHEMA)
+        # Renamed when the client moved to the OpenAI-compatible API; runs once,
+        # because after it there is no ollama_* row left to rename.
+        con.execute("UPDATE OR IGNORE settings SET key='llm_url' WHERE key='ollama_url'")
+        con.execute("UPDATE OR IGNORE settings SET key='llm_model' WHERE key='ollama_model'")
         for k, v in DEFAULT_SETTINGS.items():
             con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         # A run can only be live inside a running process; anything still marked running
@@ -352,6 +357,12 @@ def get_settings(con=None):
 
 
 def save_settings(d):
+    """Writes the known keys and returns the names it refused.
+
+    A browser tab left open across a settings rename posts the old key names, and
+    dropping those silently gave a green "Saved" while the edit went nowhere.
+    """
+    ignored = sorted(k for k in d if k not in DEFAULT_SETTINGS)
     con = connect()
     with con:
         for k, v in d.items():
@@ -362,6 +373,7 @@ def save_settings(d):
                     (k, str(v)),
                 )
     con.close()
+    return ignored
 
 
 def setting_int(s, key, default):

@@ -1,6 +1,6 @@
-"""Ollama client + the four prompts the pipeline needs.
+"""OpenAI-compatible LLM client + the four prompts the pipeline needs.
 
-Swap in another local backend by reimplementing chat() with the same signature.
+Backend-agnostic: llama.cpp's llama-server and Ollama both speak this API.
 """
 import json
 import re
@@ -12,9 +12,15 @@ class LLMError(RuntimeError):
     pass
 
 
-class Ollama:
+class LLM:
+    """OpenAI-compatible chat client.
+
+    Talks to llama.cpp's llama-server and to Ollama unchanged: both serve
+    /v1/chat/completions. Switching backend is a URL change in settings.
+    """
+
     def __init__(self, base_url, model, timeout=300.0):
-        self.base = (base_url or "http://localhost:11434").rstrip("/")
+        self.base = (base_url or "http://127.0.0.1:8081").rstrip("/")
         self.model = model
         self.timeout = timeout
 
@@ -26,25 +32,28 @@ class Ollama:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "options": {"temperature": temperature, "num_predict": num_predict},
-            # ponytail: thinking models (qwen3.x, deepseek-r1) spend the whole num_predict
-            # budget in message.thinking and return content:"" -> "empty LLM response".
-            # Off for everyone; non-thinking models ignore it. If a reasoning model is ever
-            # worth the wait, flip this per-call and raise num_predict to ~4000.
-            "think": False,
+            "max_tokens": num_predict,
+            "temperature": temperature,
+            # ponytail: thinking models (qwen3.x, deepseek-r1) spend the whole token
+            # budget reasoning and return content:"" -> "empty LLM response". Belt and
+            # braces with llama-server's --reasoning-budget 0; harmless on models that
+            # have no thinking mode. If a reasoning model is ever worth the wait, drop
+            # this per-call and raise num_predict to ~4000.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if as_json:
-            payload["format"] = "json"
+            payload["response_format"] = {"type": "json_object"}
         async with httpx.AsyncClient(timeout=self.timeout) as c:
             try:
-                r = await c.post(self.base + "/api/chat", json=payload)
+                r = await c.post(self.base + "/v1/chat/completions", json=payload)
             except httpx.HTTPError as e:
-                raise LLMError("cannot reach Ollama at " + self.base + ": " + str(e)) from e
-            if r.status_code == 404:
-                raise LLMError("model '" + self.model + "' not found. Run: ollama pull " + self.model)
+                raise LLMError("cannot reach LLM server at " + self.base + ": " + str(e)) from e
             if r.status_code >= 400:
-                raise LLMError("Ollama HTTP " + str(r.status_code) + ": " + r.text[:300])
-            return (r.json().get("message") or {}).get("content", "")
+                raise LLMError("LLM HTTP " + str(r.status_code) + ": " + r.text[:300])
+            choices = r.json().get("choices") or []
+            if not choices:
+                raise LLMError("LLM returned no choices")
+            return (choices[0].get("message") or {}).get("content") or ""
 
     async def json_chat(self, system, user, num_predict=700, temperature=0.2):
         txt = await self.chat(system, user, as_json=True, num_predict=num_predict,
@@ -53,11 +62,14 @@ class Ollama:
 
     async def health(self):
         async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(self.base + "/api/tags")
+            r = await c.get(self.base + "/v1/models")
             r.raise_for_status()
-            names = [m.get("name", "") for m in r.json().get("models", [])]
-        return {"ok": True, "models": names, "model_present": any(
-            n == self.model or n.split(":")[0] == self.model.split(":")[0] for n in names)}
+            names = [m.get("id", "") for m in r.json().get("data", [])]
+        # llama-server loads exactly one model and reports it under the file or repo it
+        # came from, which never matches a configured name. One model served = that one.
+        present = len(names) == 1 or any(
+            n == self.model or n.split(":")[0] == self.model.split(":")[0] for n in names)
+        return {"ok": True, "models": names, "model_present": present}
 
 
 def parse_json(txt):

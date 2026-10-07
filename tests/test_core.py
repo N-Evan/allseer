@@ -721,6 +721,44 @@ def test_post_api_lints_and_stores_the_draft():
         assert db.get_post(p["id"])["hooks"] == p["hooks"], "the draft is stored, not just returned"
 
 
+def test_old_llm_setting_names_migrate_and_stale_keys_are_reported():
+    with temp_db():
+        con = db.connect()
+        with con:
+            con.execute("DELETE FROM settings WHERE key IN ('llm_url','llm_model')")
+            con.execute("INSERT INTO settings VALUES('ollama_url','http://h:1')")
+            con.execute("INSERT INTO settings VALUES('ollama_model','m')")
+            con.execute("INSERT INTO settings VALUES('llm_url','http://keep')")
+        con.close()
+        db.init()  # must not crash when both old and new names exist
+        s = db.get_settings()
+        assert s["llm_url"] == "http://keep" and s["llm_model"] == "m"
+        assert db.save_settings({"ollama_url": "x", "max_fetch": "5"}) == ["ollama_url"]
+        assert db.get_settings()["max_fetch"] == "5"
+
+
+def test_dashboard_script_parses():
+    """The whole UI is one inline <script>. A single bad token there stops every button
+    working with no server-side error at all, so the syntax gets checked, not eyeballed.
+    Skipped rather than failed where node is absent - this is a guard, not a dependency.
+    """
+    import re
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        print("   (skipped: node not on PATH)")
+        return
+    html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
+    blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert blocks, "no inline script found - did the dashboard move to a .js file?"
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "ui.js"
+        f.write_text(chr(10).join(blocks), encoding="utf-8")
+        r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, "static/index.html has a JS syntax error: " + r.stderr
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_"):

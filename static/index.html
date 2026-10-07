@@ -182,7 +182,7 @@ label.f span{display:block;font-size:12px;color:var(--dim);margin-bottom:3px}
     <h2>Research settings</h2>
     <div class="card" style="cursor:default"><div class="grid2" id="settingsForm"></div>
       <button class="primary" id="saveSettings">Save settings</button>
-      <button id="checkHealth">Check Ollama / SearXNG</button>
+      <button id="checkHealth">Check LLM / SearXNG</button>
       <div class="hint" id="healthOut" style="margin-top:8px"></div>
     </div>
   </section>
@@ -202,7 +202,8 @@ const api = async (p, o) => {
 let STATE = {}, VIEW = 'today', HIST = {run_id: null, day: null};
 
 const SETTING_HELP = {
-  ollama_url: 'Ollama base URL', ollama_model: 'Ollama model (e.g. llama3.1:8b)',
+  llm_url: 'LLM server base URL - llama.ps1 serves on http://127.0.0.1:8081',
+  llm_model: 'Model name; llama-server serves whatever it loaded, so any label works',
   searxng_url: 'SearXNG base URL - optional, leave blank to use the keyless providers only',
   queries_per_topic: 'Search queries generated per topic',
   max_fetch: 'Max pages to download per topic', max_llm: 'Max items scored by the LLM per topic',
@@ -211,7 +212,7 @@ const SETTING_HELP = {
   page_cache_days: 'Reuse page text fetched this recently instead of downloading again (0 = off)',
   dislike_drop: 'Net downvotes that ban a domain from every future run (0 = never ban)',
   digest_dir: 'Folder for the markdown digest written after each run (blank = off)',
-  analysis_model: 'Model used for judging and analyst notes; blank = same as ollama_model',
+  analysis_model: 'Model for judging and analyst notes; blank = same as llm_model. Needs a second llama-server on another port to differ',
   drop_undated: '1 = discard items with no publish date at all (strict)',
   suppress_seen_days: 'Skip links already promoted in a run this recent (0 = off)',
   github_min_stars: 'Minimum stars for a newly created repo to be worth a slot (0 = off)',
@@ -645,7 +646,11 @@ document.addEventListener('click', async e => {
   if (t.id === 'saveSettings') {
     const body = {};
     document.querySelectorAll('[data-set]').forEach(i => body[i.dataset.set] = i.value);
-    await api('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const r = await api('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if ((r.ignored || []).length) {
+      alert('These were NOT saved because this page is out of date: ' + r.ignored.join(', ')
+            + '. Reload the page with Ctrl+Shift+R and set them again.');
+    }
     t.textContent = 'Saved'; setTimeout(() => t.textContent = 'Save settings', 1200); loadState();
   }
   if (t.dataset.unpick) { SEL.delete(t.dataset.unpick); renderChips(); loadPickList(); }
@@ -689,8 +694,8 @@ document.addEventListener('click', async e => {
     $('#healthOut').textContent = 'checking...';
     const h = await api('/api/health');
     $('#healthOut').textContent =
-      'ollama: ' + (h.ollama.ok ? ('ok, model present=' + h.ollama.model_present + ', models: ' + (h.ollama.models||[]).join(', '))
-                                : ('FAILED - ' + (h.ollama.error||'unreachable')))
+      'llm: ' + (h.llm.ok ? ('ok, model present=' + h.llm.model_present + ', models: ' + (h.llm.models||[]).join(', '))
+                             : ('FAILED - ' + (h.llm.error||'unreachable')))
       + ' | searxng configured: ' + h.searxng.configured;
   }
 });
