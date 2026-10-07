@@ -404,7 +404,7 @@ async function openItem(id){
     </div>
     <h2 style="margin-top:16px">${esc(it.topic_name||'')}</h2>
     <h3 style="font-size:21px;margin:0 0 8px">${esc(it.title)}</h3>
-    <div class="meta"><a href="${esc(it.url)}" target="_blank" rel="noopener">${esc(it.domain)} &nearr;</a>
+    <div class="meta"><a href="${/^https?:\/\//i.test(it.url||'') ? esc(it.url) : '#'}" target="_blank" rel="noopener">${esc(it.domain)} &nearr;</a>
       <span>&middot;</span><span>${when(it.published_at)}</span>${it.author?`<span>&middot;</span><span>${esc(it.author)}</span>`:''}</div>
     ${it.llm_summary?`<h2>Factual summary</h2><p>${esc(it.llm_summary)}</p>`:''}
     ${facts.length?`<h2>Stated in the source</h2><ul class="facts">${facts.map(f=>`<li>${esc(f)}</li>`).join('')}</ul>`:''}

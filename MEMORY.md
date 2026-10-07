@@ -78,8 +78,7 @@ Headless: `python run.py --once`. Tests: `python tests/test_core.py`.
 - **SearXNG ships with the JSON API disabled.** A stock instance answers `?format=json`
   with `403 Forbidden` (an HTML body), which surfaces as `expected JSON, got text/html`.
   Fix is in the *instance*, not allseer: add `search: {formats: [html, json]}` to its
-  `settings.yml` and restart. This machine's instance is at `http://127.0.0.1:1991`, Docker
-  container `searxng-core`, config bind-mounted from `<your searxng config dir>`.
+  `settings.yml` and restart (with Docker, the one in the bind-mounted config folder).
   SearXNG results essentially never carry `publishedDate`, so they arrive undated.
 
 ## Freshness is enforced centrally, not per provider
