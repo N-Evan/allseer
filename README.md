@@ -1,394 +1,262 @@
+<div align="center">
+
+<img src="docs/screenshots/hero.png" alt="allseer: the Today view on desktop next to an item's detail sheet on a phone" width="100%">
+
 # allseer
 
-Fully local research/trend monitor. For each topic you configure it finds **today's top 3
-stories** plus **3-5 niche finds** worth investigating, summarises them with a local LLM,
-and stores everything in SQLite for browsing. The **Write** tab turns any of them into a
-LinkedIn draft in your own voice.
+**A fully local research agent for the stuff you're supposed to keep up with.**<br>
+Every morning it reads the web, keeps **today's top 3** and **the niche finds worth your time**,
+and tells you which parts are fact and which are the model's opinion.
 
-No paid APIs, no cloud, no accounts, no Docker required.
+![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
+![SQLite FTS5](https://img.shields.io/badge/DB-SQLite_FTS5-003b57?style=flat-square&logo=sqlite&logoColor=white)
+![Local LLM](https://img.shields.io/badge/LLM-llama.cpp_%7C_Ollama-c084fc?style=flat-square)
+![Cloud APIs: 0](https://img.shields.io/badge/cloud_APIs-0-37d399?style=flat-square)
+![Runtime deps: 4](https://img.shields.io/badge/runtime_deps-4-5b9cff?style=flat-square)
+![No build step](https://img.shields.io/badge/frontend-no_build_step-98a2b3?style=flat-square)
+![License: MIT](https://img.shields.io/badge/license-MIT-fbbf24?style=flat-square)
 
-## Setup (Windows, no Docker)
+</div>
 
-```powershell
-# 1. A local LLM server speaking the OpenAI chat API. Either works.
-#    a) llama.cpp - download the CUDA build for your GPU from
-#       https://github.com/ggml-org/llama.cpp/releases, unzip, then:
-powershell -ExecutionPolicy Bypass -File .\llama.ps1   # edit paths/model inside first
-#    b) Ollama - install from https://ollama.com, pull a model, and set
-#       llm_url to http://localhost:11434 in Settings.
+---
 
-# 2. Python deps
-python -m pip install -r requirements.txt
+## Why it exists
 
-# 3. Run
-python run.py
-```
+Keeping up with a field usually means one of two things. You doom-scroll five feeds and
+come away with the same headline five times, or you pay for a cloud tool that summarises
+everything and doesn't say which part it made up.
 
-Open http://127.0.0.1:8077, press **Run Research Now**.
+allseer does the reading on your own machine. For each topic you configure it searches
+Hacker News, GitHub, arXiv, RSS feeds and the open web, throws away the stale, the
+off-topic and the SEO junk *before* any inference happens, and has a local LLM judge
+what's left. You get two short lists, **trending** and **niche**, and each pick comes with
+a summary limited to what the source says, the claims it actually makes, and a clearly
+labelled opinion on why it matters.
 
-```powershell
-python run.py --reload   # restart the server on every code edit
-python run.py --once     # one headless run, for Task Scheduler
-python run.py --port 9000
-```
+When something is worth sharing, the **Write** tab turns it into a LinkedIn post in your
+own voice, and lints the draft for the phrases that make posts read as AI-written.
 
-That's it. SearXNG is optional (see below) - the keyless providers work without it.
+<div align="center">
+<img src="docs/screenshots/mobile.png" alt="Today, Detail and Write views on mobile" width="100%">
+</div>
 
-## What it searches
+---
 
-| Provider | Source | Key needed |
-|---|---|---|
-| `hn` | Hacker News (Algolia API) | no |
-| `rss` | Every feed URL in the `rss_feeds` setting - 80.lv, Game Developer, GamesIndustry, Godot, itch.io, HuggingFace, and subreddit `top.rss` feeds | no |
-| `github` | GitHub repo search, **`created:>`** so only genuinely new repos match | no (unauthenticated, ~10 searches/min) |
-| `arxiv` | arXiv Atom API | no |
-| `searxng` | Any SearXNG instance = news sites, blogs, everything else | no, but needs an instance |
-| `reddit` | Reddit search Atom feed - **off by default**, unauthenticated Reddit 429s after ~1 request; use its subreddit feeds via `rss` instead | no |
+## Key strengths
 
-Edit the `providers` setting to enable/disable.
+### 🎯 Two short lists instead of a feed
+- **Today's Top 3** ranks on recency, coverage across independent sources, relevance,
+  source quality and discussion. Five reprints of one press release count as **one** source.
+- **Niche finds** ranks on novelty, depth, importance and *low* coverage, so it surfaces the
+  small repo or the one-person blog post you'd never have found, rather than the same
+  headline again.
+- **Every score is shown.** Each card lists its signals (`relevance 9.0 · novelty 8.0 ·
+  cross source 6.7 …`), so you can see why something ranked where it did.
+- **No list belongs to one site.** One domain gets one slot per list, and the
+  fetch-and-judge budget is shared round-robin across providers, then across domains.
 
-### rss - the highest-signal source
+### 🧪 Facts and opinion are kept apart
+Each pick separates what the source says from what the model thinks:
 
-Feeds are complete, dated and never rate-limited, which makes them better than any search
-API for gamedev/devlog material. Add a URL to `rss_feeds` (space or comma separated) and
-it is live on the next run; nothing else changes. Each feed is fetched **once per run** and
-cached, so extra queries over it are nearly free.
-
-A feed cannot be searched, so entries are filtered locally: any distinctive word (>3 chars)
-of the query must appear in the title or summary. That is deliberately generous - the LLM
-judge is the real filter.
-
-Each feed answers at most `FEED_CAP` (10) entries per query, best-matching first. Without
-that cap, `"solo developer game jam insights"` matched 80 entries on one gamedev feed,
-because every article there contains both "game" and "developer".
-
-LinkedIn has no public feed and blocks unauthenticated fetches, so it cannot be a provider.
-
-### Per-topic feeds and providers
-
-`rss_feeds` and `providers` are global settings, which does not work once two topics want
-different sources. A topic row may override either one:
-
-| Column | Empty means | Set means |
-|---|---|---|
-| `topics.feeds` | use the global `rss_feeds` | use only these feeds, **and** use the topic's keywords verbatim as the queries instead of generating LLM angles |
-| `topics.providers` | use the global `providers` | use only these providers for this topic |
-
-The jobs topic uses both. Job boards must not answer gamedev queries, gamedev feeds must
-not answer role queries, and arXiv/GitHub/HN have nothing to say about a job hunt - left
-enabled they returned "solar eruption analyses" and Show HN posts for `platform engineer`,
-because the shortlist gives every enabled provider an equal share.
-
-Pinned queries matter for the same reason: a listing is titled *"Senior Unity Developer
-(Remote)"* and only matches a query that literally says `unity developer`. An LLM angle
-like *"remote gameplay hiring trends"* matches nothing in a job feed.
-
-### Optional: SearXNG
-
-Point the `searxng_url` setting at any instance whose JSON API is open. Locally:
-
-```powershell
-docker run -d --name searxng -p 8080:8080 -e SEARXNG_SETTINGS_PATH=/etc/searxng docker.io/searxng/searxng
-# then set searxng_url = http://localhost:8080
-```
-
-**The JSON API is off by default** - a stock instance answers `?format=json` with
-`403 Forbidden`, which allseer logs as `expected JSON, got text/html`. Add this to the
-instance's `settings.yml` and restart it:
-
-```yaml
-search:
-  formats:
-    - html
-    - json
-```
-
-SearXNG results almost never carry a publish date, so they arrive undated. They survive the
-freshness gate on that basis (see `drop_undated`) until the page fetch reveals a real date.
-
-If it is unreachable the run logs the failure and continues with the other providers.
-
-## Two ways to run it
-
-- **Run Research Now** - every enabled topic, the daily dossier.
-- **Research this** (box at the top of Today) - a one-off subject typed right now, e.g.
-  *"RISC-V laptops"*, with an optional exclusion. It is researched immediately through the
-  same pipeline and stored in history, but never saved as a topic. Your exact wording is
-  used as the first search query, then the LLM generates angles around it.
-- **Stop** - appears while a run is in progress and cancels it immediately, including the
-  search, page fetch or LLM call in flight. The run is marked `cancelled`; whatever was
-  already stored stays browsable.
-
-Only one run happens at a time - starting a second returns 409 rather than queueing.
-
-## What gets thrown away before the LLM sees it
-
-Inference is the scarce resource, so four cheap gates run first. Each one logs how much it
-dropped, and the counts land in the run's `stats`.
-
-| Gate | Where | Drops |
-|---|---|---|
-| `providers.JUNK` | as results are built | facebook, linkedin, x, instagram, pinterest, quora, wikipedia, tiktok, podcast and course-mill hosts - never the artefact, always a link to it, and every one blocks the fetch |
-| bare site roots | as results are built | a URL with no path is a *publication*, not a story - SearXNG answers "indie devlog" with homepages, and four of them won niche slots in one run |
-| `rank.fresh_enough` | after search, again after fetch | anything with a known date outside `days_back` |
-| `rank.excluded` | after search | the topic's own `exclusions`, matched on the title with word boundaries and an optional plural, so `courses` trips `course` but `Hacking the Godot renderer` survives `hack` |
-| `rank.on_topic` | after search | fewer than two distinct topic keywords - one shared generic word ("game", "developer") is not evidence |
-
-Then `rank.diversify()` picks who gets fetched and judged: **round-robin across providers
-first, then across domains inside each provider.** Score order alone gave one run's entire
-LLM budget - 20 items out of 20 - to github.com, because GitHub is the only provider that
-reports a discussion number (stars), which made `discussion_score` an "is this GitHub?"
-term in practice. Round-robin on domain alone then handed it to SearXNG, which returns
-~100 one-off domains per run against RSS's ~10.
-
-Ranking still happens afterwards on the real scores; this only decides who gets looked at.
-
-## Teaching it what you like
-
-Every card has a thumb up and a thumb down. That vote is the only part of the system that
-knows what *you* consider a good find, and it does three things on the next run:
-
-| Vote | Effect |
+| Section | Where it comes from |
 |---|---|
-| up | that domain scores higher in the pre-LLM triage, so it is likelier to get a fetch and an inference slot |
-| down | the same, downward - and the title becomes a negative example in the judge's prompt |
-| net `-3` on a domain | the domain is dropped outright, before the fetch, in every future run |
+| **Factual summary** | Only the fetched page text |
+| **Stated in the source** | Specific claims pulled from the page |
+| **AI interpretation** | The model's opinion, labelled *not from the source* |
+| **Analyst note** | What it is / why it matters / what to check next / **confidence**, for the shortlist only |
 
-A vote is keyed by **canonical URL, not by run**, so it sticks to the link, and voting on
-the same story found again next week overwrites rather than double-counts. Voting `0`
-clears it.
+### 🧹 Cheap filters before expensive inference
+Inference is the slow part, so the cheap filters run first and each one logs how much it dropped:
+junk hosts (social, Q&A, course mills), bare site roots, anything outside the freshness window
+(checked again after the fetch, when undated items show their real date), per-topic exclusions
+matched on word boundaries, and results with fewer than two distinct topic keywords. Extracted
+page text is **cached for 14 days**, so pages read in earlier runs aren't downloaded again.
 
-The bias is `tanh(net / 3)`, added to the prefilter as a signed `+/-0.15` term against a
-roughly 0-1 base. It saturates on purpose: three downvotes should already mean "stop
-showing me this", but the thirtieth must not outweigh recency, relevance and coverage
-combined.
+### 👍 Learns from two buttons
+Thumbs up or down on any card. Votes are keyed by **link, not run**, and on the next run they:
+- shift a domain's pre-filter score by a capped `tanh(net / 3)`, so the thirtieth downvote
+  can't outweigh recency, relevance and coverage put together,
+- **ban a domain** outright once its net score reaches −3,
+- give the judge your five latest likes and dislikes as examples, the only part of its
+  prompt that's about you rather than generic.
 
-Votes on a topic count double for that topic and single elsewhere - a domain can be right
-for the job hunt and wrong for devlogs. The ban threshold is the `dislike_drop` setting;
-`0` turns banning off and keeps only the soft bias.
+### ✍️ Write: a LinkedIn post in your own voice
+- **Nine angles** (Signal, Discovery, Field notes, Teardown, Contrarian, Thought-provoker,
+  Ask the room, Lesson, and **Synthesis**, which links 2+ finds into one pattern).
+- **Three hooks** to choose from, an editable body, hashtags, and a **first comment** for the
+  link, since LinkedIn shows posts with outbound links to fewer people.
+- **Your author profile** (role, audience, voice, a paragraph of your own writing, phrases
+  you never use) goes into every prompt. Strict rules: no invented numbers, no claiming
+  you used something unless your take says so.
+- **A lint pass** flags clichés, emoji, overlong hooks, hashtag spam, bait questions and
+  walls of text as amber chips. It never blocks you.
 
-The judge prompt gets your five most recent likes and dislikes as titles, labelled
-`Rated USEFUL` / `Rated JUNK`. This is the one part of the prompt that is not generic
-advice, and it is where a bigger `analysis_model` pays off - a 14B model calibrates
-against examples noticeably better than an 8B one.
+### 🔎 Every run stays searchable
+- **SQLite FTS5** across every run's titles, summaries, tags and domains, with prefix
+  matching as you type. Typed text is quoted token by token, so `c++` or a stray quote can't
+  break the query.
+- **History** shows how long each run spent on each stage (`judge 7.5m · fetch 1.9m · 23 cached`),
+  so you know whether to tune the model or the network.
+- **A markdown digest** of each run is written to `digests/`. You can read it on a phone or
+  grep it from a shell, and it outlasts the database.
 
-`GET /api/feedback` shows the current per-domain standing, so you can see what your
-voting has actually taught it.
-
-## Searching every run
-
-The search box queries an SQLite **FTS5** index over `title`, `snippet`, `llm_summary`,
-`llm_tags` and `domain`, across your whole history - not just the run on screen. Results
-come back newest-run-first. Opening a specific run or day from History scopes the search
-back to it.
-
-The last word is a prefix, so `geometr` finds "geometry" while you type, and extra words
-narrow rather than widen. Typed text is never valid FTS5 syntax on its own (`c++` and a
-stray quote both raise), so `db.fts_query()` quotes every token into a literal phrase
-before it reaches `MATCH`.
-
-The index is external-content: the rows live in `items` and two triggers keep the index in
-step. An older database is backfilled at startup - which is checked by comparing
-`items_fts_docsize` to `items`, **not** by selecting from `items_fts`, because an
-external-content table reads its column values from `items` and so reports every row even
-when the index is empty and no `MATCH` can find a thing.
-
-## The digest
-
-Every finished run writes `digests/YYYY-MM-DD-run<id>.md`: the promoted items only, grouped
-by topic and bucket, with the summary and the AI interpretation. A run that finishes into a
-browser tab is a run you have to remember to open; the same content on disk is readable on
-a phone, greppable from a shell, and outlives the database. Set `digest_dir` blank to turn
-it off.
-
-## Writing a LinkedIn post about a find (Write tab)
-
-Research surfaces the material; the **Write** tab turns a find into a post you would not be
-embarrassed to publish.
-
-Tick one item for a single-source post, or two or more for a **synthesis** that connects
-them into one pattern. Pick an angle, a length and whether you want hashtags, add your own
-take in one line, and generate. You get **three different hooks** to choose between, an
-editable body, the hashtags, and the text for the **first comment** - the link goes there,
-because LinkedIn throttles posts that send people off-platform.
-
-Nine angles, hardcoded in `allseer/llm.py` so tuning one is a one-line edit:
-
-| Angle | What it writes | Closes on |
+### 🏠 Local, keyless, and hard to break
+| Provider | Source | Key |
 |---|---|---|
-| Signal | one development and what it changes | the implication |
-| Discovery | something obscure, in plain terms, honestly early | who should care |
-| Field notes | a practitioner account - **requires your take**, the take is the experience | what you'd do differently |
-| Teardown | how the thing works, for a competent non-specialist | the trade-off it buys |
-| Contrarian | a common belief set fairly against what the source shows | the strongest counterpoint |
-| Thought-provoker | the second-order consequence nobody is discussing | open, as a statement |
-| Ask the room | context, your lean, then one answerable question | the only angle that ends on `?` |
-| Lesson | a transferable principle, source as evidence | where it stops applying |
-| Synthesis | 2+ finds as one pattern (needs 2+ items) | what the pattern predicts |
+| `hn` | Hacker News (Algolia) | none |
+| `github` | Repo search, `created:>` so only genuinely new repos match | none |
+| `arxiv` | arXiv Atom API | none |
+| `rss` | Any feeds you list, fetched once per run and filtered locally | none |
+| `searxng` | Your own SearXNG instance, i.e. the open web | none |
 
-### Why the output does not read as AI slop
+Topics can **pin their own feeds and providers**. The built-in job-hunt topic uses job boards
+only, so they never answer a devlog query. **One error doesn't kill a run.** 403s, paywalls,
+pages that need JavaScript, a model returning bad JSON, or an LLM server that's down all get
+logged, and the run carries on with what it has. **Stop** cancels a run straight away and keeps
+whatever was already stored.
 
-Three things, in order of how much they matter:
+### ⚙️ Engineering that stays small
+- **Four runtime dependencies:** FastAPI, uvicorn, httpx, trafilatura. Storage is the
+  standard library's `sqlite3`.
+- **The whole dashboard is one HTML file** of plain JS. No framework, no bundler, no build step.
+- **Any OpenAI-compatible server works:** llama.cpp's `llama-server` or Ollama, with an
+  optional bigger `analysis_model` for judging.
+- **45 core checks** that need no network and no LLM: `python tests/test_core.py`.
+- About 4.5k lines in total.
 
-1. **Your author profile.** The six `persona_*` settings - role, expertise, audience, voice,
-   a paragraph of your own writing, and phrases you never use. `persona_sample` does the
-   most work of any single setting in the app: it is the only thing in the prompt that
-   knows how *you* sound. Leave them blank and every post is written from the article
-   alone, which is exactly the generic case this exists to avoid. The Write tab says so
-   until you fill them in. Empty fields are never sent.
-2. **Fixed prompt rules.** Facts only from the source - no invented number, quote,
-   benchmark, version or date. Never claims you used or attended anything unless your take
-   says so. One idea, short paragraphs, no emoji, the source named in the text, no closing
-   question except on `ask`, and a banned-phrase list (`game changer`, `let that sink in`,
-   `thrilled to announce`, `check it out`, and friends).
-3. **A lint pass over the result.** Every hook - not just the first - plus the body and
-   hashtags are checked for banned phrases, emoji, an over-long hook, hashtag spam, a bait
-   question, and wall-of-text formatting. Findings show as amber chips beside
-   **Regenerate**. They never block: you read a bad post faster than a retry loop rewrites
-   one.
+---
 
-Drafts are stored in the `posts` table and listed under the composer, so a good one from
-last week is still there. Item titles are copied into the draft, so it stays readable even
-if the topic that found it is deleted.
+## Screenshots
 
-Post writing is one LLM call awaited directly, not a pipeline run - you can write a post
-while research is running. It uses `analysis_model` if set. On `qwen2.5:14b` expect
-20-60 seconds.
+| Today: ranked and explained | Detail: facts vs interpretation |
+|---|---|
+| <img src="docs/screenshots/today.png" alt="Today view with ranked cards"> | <img src="docs/screenshots/detail.png" alt="Item detail sheet with analyst note"> |
+| **A run in progress** | **Search across every run** |
+| <img src="docs/screenshots/running.png" alt="Live progress log during a run"> | <img src="docs/screenshots/search.png" alt="Full-text search results"> |
+| **Write: a synthesis draft** | **History with stage timings** |
+| <img src="docs/screenshots/write.png" alt="LinkedIn draft with hooks, body and first comment"> | <img src="docs/screenshots/history.png" alt="Past runs with timing badges"> |
 
-## What it does not download twice
+<details>
+<summary>More: light mode and settings</summary>
 
-`max_fetch` is 40 pages a topic and at most 8 items are ever promoted, so most of every
-fetch budget was going on pages an earlier run had already read. Extracted text is now kept
-in `page_cache` and reused for `page_cache_days` (14). Failed extractions are cached too -
-a page that yields nothing today will yield nothing tomorrow, and skipping it is the point.
-Set `page_cache_days` to `0` to always refetch.
+<img src="docs/screenshots/modes.png" alt="The dashboard in dark and light mode">
 
-This is not the same as `suppress_seen_days`, which hides links already *promoted*. The
-cache helps the much larger set that was fetched and never shortlisted.
+<img src="docs/screenshots/settings.png" alt="Topics with keywords, exclusions and per-topic overrides">
 
-## Where the time went
+</details>
 
-A run takes 5-15 minutes and the log never said which stage owned it. Each run's `stats`
-now carries `secs` - `search`, `fetch`, `judge`, `analyse` - shown as a badge on the run in
-History, along with how many pages came from the cache. Check it before changing a setting:
-a slow model and a slow network want opposite fixes.
+---
 
 ## How the ranking works
 
-Deterministic signals are computed in Python; only judgement calls come from the LLM.
+Fixed rules in Python handle everything they can. The LLM is only asked for judgement calls
+(relevance, novelty, depth, importance) as numbers from 0 to 10.
 
-**PREFILTER** (who gets the fetch and inference budget) = 0.30 topic match + 0.25 recency
-+ 0.15 cross-source + 0.15 source quality + 0.10 discussion + 0.05 has text
-
-**TRENDING** = 0.25 recency + 0.25 cross-source coverage + 0.25 relevance
-+ 0.10 source quality + 0.15 discussion
-**NICHE** = 0.25 novelty + 0.25 depth + 0.15 relevance + 0.15 importance + 0.20 *low* coverage
-
-- Recency has a 24h half-life; an unknown date is treated as ~3 days old, never as fresh.
-- Cross-source coverage counts **distinct domains** in the same story cluster, so five
-  reprints of one press release count once.
-- Niche penalises mainstream aggregators and thin pages, so it surfaces the small repo or
-  the one-person blog post rather than the same headline again.
-- An item never appears in both lists, and one domain gets at most one slot per list.
-- Weights live in `allseer/rank.py`; change them there.
-
-Only the shortlisted items get a second, expensive LLM pass (the analyst note).
-
-## Facts vs interpretation
-
-Every card separates them on purpose:
-
-- **Factual summary** and **Stated in the source** - constrained to the fetched text.
-- **AI interpretation** ("why this matters") and **Analyst note** - the model's opinion,
-  labelled as such in the UI, with a self-reported confidence level.
-
-## Settings (Settings tab)
-
-| Setting | Meaning |
+| List | Formula |
 |---|---|
-| `llm_url`, `llm_model` | local LLM server, any OpenAI-compatible one. llama-server ignores `llm_model` and serves whatever it loaded; Ollama uses it to pick |
-| `analysis_model` | model used for judging and the analyst notes; blank = same as `llm_model`. Query generation is cheap and forgiving, judging is where a bigger model shows. Differing from `llm_model` needs a backend that holds two models - a second llama-server on another port, or Ollama |
-| `searxng_url` | optional, blank = off |
-| `queries_per_topic` | search angles generated per topic (6 is a good default) |
-| `max_fetch` | pages downloaded per topic |
-| `max_llm` | items scored by the LLM per topic - **this is what run time depends on** |
-| `top_trending`, `top_niche` | slots per list |
-| `days_back` | **hard** freshness window - anything with a known date older than this is discarded before ranking |
-| `drop_undated` | `1` = also discard items with no publish date at all (strict; costs you most SearXNG hits) |
-| `suppress_seen_days` | skip links already promoted to a bucket in a run this recent (`21`); `0` = off |
-| `providers` | comma separated provider names |
-| `rss_feeds` | feed URLs for the `rss` provider, space or comma separated |
-| `page_cache_days` | reuse page text fetched this recently instead of downloading it again; `0` = always refetch |
-| `dislike_drop` | net downvotes that ban a domain from every future run (`3`); `0` = soft bias only |
-| `digest_dir` | folder for the per-run markdown digest (`digests`); blank = off |
-| `persona_role`, `persona_expertise`, `persona_audience`, `persona_voice`, `persona_sample`, `persona_avoid` | who is writing the LinkedIn posts. `persona_sample` - a paragraph of your own writing - is the single highest-leverage field in this table |
+| **Pre-filter** *(who gets fetched and judged)* | 0.30 topic match + 0.25 recency + 0.15 cross-source + 0.15 source quality + 0.10 discussion + 0.05 has text ± 0.15 vote bias |
+| **Trending** | 0.25 recency + 0.25 cross-source + 0.25 relevance + 0.10 source quality + 0.15 discussion |
+| **Niche** | 0.25 novelty + 0.25 depth + 0.15 relevance + 0.15 importance + 0.20 *low* coverage |
 
-A run with `max_llm=35` on an 8B model takes roughly 5-15 minutes. Start smaller.
+Recency has a 24-hour half-life, and an unknown date counts as about three days old, never as
+fresh. Niche penalises big aggregators and pages too thin to show any depth. An item never
+appears in both lists. The weights live in [`allseer/rank.py`](allseer/rank.py).
 
-### Why a run can be perfect on disk and broken in the browser
+---
 
-Start it with `python run.py --reload` while editing and this cannot happen.
+## Architecture
 
-Without that flag the dashboard keeps serving the modules it imported at startup,
-silently, forever, and a run made that way looks like a retrieval failure when it is not:
-
-- `rss` was in the `providers` setting but not in the old `REGISTRY`, so `REGISTRY.get()`
-  returned `None` and the provider was **skipped with no error** - zero feed results.
-- the old GitHub query still used `pushed:>`, so 2014-2016 repos came back.
-- `fresh_enough()` did not exist yet, so nothing filtered them.
-
-Tell them apart in one glance: the run's `stats` should contain `dropped_stale`,
-`dropped_seen`, `dropped_offtopic` and `dropped_excluded`. If those keys are missing, the
-server is older than the code on disk - restart it, or use `--reload`.
-
-### Why old items used to show up
-
-`days_back` was only ever a *hint* passed to each provider, and each honoured it
-differently - GitHub not at all: it filtered on `pushed:>` while reporting `created_at` as
-the publish date, so a repo created in 2014 and pushed yesterday sailed through. Nothing
-downstream re-checked, and `NICHE_WEIGHTS` has no recency term, so those items won niche
-slots outright. It is now enforced centrally in `rank.fresh_enough()`, twice per topic:
-once after the search and again after the page fetch (which is when an undated item often
-reveals its real date).
-
-`suppress_seen_days` covers the other half of the complaint: without it, the same evergreen
-repo was re-promoted every single run, so the output looked stale even when the sources had
-moved on.
-
-## Files
-
-```
-run.py                  launcher (--reload while editing, --once for a headless run)
-allseer/db.py           SQLite schema, settings, votes, page cache, FTS helpers
-allseer/providers.py    search providers (add one here)
-allseer/extract.py      page fetch + text extraction
-allseer/dedupe.py       URL identity + same-story clustering
-allseer/llm.py          LLM client (OpenAI API) + the 4 prompts, post angles, draft lint
-allseer/rank.py         scoring formulas + list selection
-allseer/pipeline.py     the run, start to finish
-allseer/app.py          FastAPI API + dashboard host
-static/index.html       the whole dashboard (no build step)
-tests/test_core.py      python tests/test_core.py - no network, no LLM, ~1.5s
-allseer.db              created on first run
-digests/                one markdown file per run
+```mermaid
+flowchart LR
+  subgraph Search
+    HN[hn] & GH[github] & AX[arxiv] & RSS[rss feeds] & SX[searxng]
+  end
+  Search --> G["Cheap filters<br/>junk · stale · excluded<br/>off-topic · banned domains"]
+  G --> C["dedupe.py<br/>same-story clusters"]
+  C --> D["diversify<br/>round-robin providers → domains"]
+  D --> F["extract.py<br/>fetch + page_cache"]
+  F --> J["llm.py · judge<br/>scores + summary + facts"]
+  J --> R["rank.py<br/>trending / niche"]
+  R --> A["analyst notes<br/>shortlist only"]
+  A --> DB[("SQLite<br/>items · FTS5 · votes")]
+  DB --> UI["static/index.html<br/>Today · History · Write"]
+  DB --> MD["digests/*.md"]
+  UI -- "votes" --> G
 ```
 
-Tables in `allseer.db`: `topics`, `runs`, `items`, `settings`, `feedback` (your votes,
-keyed by canonical URL), `page_cache` (extracted text, reused across runs), `items_fts`
-(the search index over `items`), and `posts` (your LinkedIn drafts).
+| Path | Role |
+|---|---|
+| `allseer/pipeline.py` | One run from start to finish, with stage timings and cancellation |
+| `allseer/providers.py` | Search providers and the junk-host list. Add a provider here |
+| `allseer/rank.py` | Freshness, topic and exclusion filters, the scoring formulas, list selection |
+| `allseer/llm.py` | OpenAI-compatible client, the four prompts, post angles, draft lint |
+| `allseer/dedupe.py` | URL canonicalisation and same-story clustering |
+| `allseer/extract.py` | Page fetch and readable-text extraction |
+| `allseer/db.py` | Schema, settings, votes, page cache, FTS helpers, drafts |
+| `allseer/app.py` | FastAPI JSON API that also serves the dashboard |
+| `static/index.html` | The whole UI |
 
-## Scheduling (optional)
+---
 
-`python run.py --once` runs a full research pass over the enabled topics and exits. Point Windows Task Scheduler at
-it for a daily 7am dossier:
+## Getting started
+
+```powershell
+# 1. A local LLM server that speaks the OpenAI chat API. Either works:
+#    llama.cpp: edit the paths in llama.ps1, then
+powershell -ExecutionPolicy Bypass -File .\llama.ps1      # serves on :8081
+#    Ollama: install, pull a model, set llm_url = http://localhost:11434 in Settings
+
+# 2. Install and run
+python -m pip install -r requirements.txt
+python run.py                                             # http://127.0.0.1:8077
+```
+
+Open the dashboard and press **Run Research Now**, or type any subject into **Research this**
+for a one-off run that isn't saved as a topic.
+
+```powershell
+python run.py --reload    # restart on every code edit
+python run.py --once      # one headless run, then exit
+python run.py --port 9000
+```
+
+**A morning dossier every day:** point Task Scheduler at `--once`.
 
 ```powershell
 schtasks /create /tn allseer /tr "python C:\path\to\allseer\run.py --once" /sc daily /st 07:00
 ```
 
-## Failure behaviour
+**SearXNG (optional)** adds the open web. Set `searxng_url`, and turn on the JSON API in the
+instance's `settings.yml` (`search.formats: [html, json]`), because it's off by default.
 
-Nothing in a run is fatal. Provider errors, 403s, paywalls, JS-only pages, unparseable
-dates, a stopped LLM server, and bad JSON from a small model are all logged to the progress
-panel and the run continues with what it has. If the LLM is down entirely you still get
-searched, deduplicated, unscored discoveries under "Everything discovered".
+The most important settings:
+
+| Setting | What it does |
+|---|---|
+| `llm_url`, `llm_model` | Your local LLM server and model |
+| `analysis_model` | A bigger model just for judging and analyst notes (blank = same model) |
+| `max_llm` | Items judged per topic. **Run time depends mostly on this** |
+| `days_back` | Hard freshness window. Anything older is dropped before ranking |
+| `suppress_seen_days` | Don't show links already picked within this many days |
+| `persona_*` | Your author profile for the Write tab. `persona_sample` matters most |
+
+The full list, and the reasoning behind each filter and weight, is in
+[`docs/DESIGN.md`](docs/DESIGN.md).
+
+---
+
+## Deliberately not built
+
+- **No cloud fallback.** If the LLM is down you still get the searched, deduplicated,
+  unscored results under *Everything discovered*, but nothing leaves the machine.
+- **No LinkedIn or Reddit search provider.** LinkedIn has no public feed and blocks
+  fetches without a login. Reddit search stops answering after about one anonymous request,
+  so subreddits come in through their RSS feeds instead.
+- **No auto-posting.** The Write tab copies to your clipboard. You choose what gets published.
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Md. Nurusshafi Evan
